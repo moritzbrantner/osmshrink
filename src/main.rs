@@ -14,18 +14,32 @@ async fn main() -> anyhow::Result<()> {
     init_tracing(cli.verbose, cli.quiet)?;
 
     match cli.command {
-        Commands::Fetch { source, output } => {
+        Commands::Fetch {
+            source,
+            output,
+            force,
+        } => {
             let options = FetchOptions {
                 show_progress: !cli.quiet,
+                force,
             };
             let report = download_source(&source, &output, &options).await?;
             if !cli.quiet {
-                eprintln!(
-                    "Downloaded {} bytes from {} to {}",
-                    report.bytes_written,
-                    report.url,
-                    report.output.display()
-                );
+                if report.cached {
+                    eprintln!(
+                        "Using cached {} bytes from {} at {}",
+                        report.bytes_written,
+                        report.url,
+                        report.output.display()
+                    );
+                } else {
+                    eprintln!(
+                        "Downloaded {} bytes from {} to {}",
+                        report.bytes_written,
+                        report.url,
+                        report.output.display()
+                    );
+                }
             }
         }
         Commands::Filter {
@@ -67,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
                 &pbf_path,
                 &FetchOptions {
                     show_progress: !cli.quiet,
+                    force: false,
                 },
             )
             .await?;

@@ -48,6 +48,13 @@ cargo run -- fetch geofabrik:europe/germany/baden-wuerttemberg --output data/bw.
 cargo run -- fetch https://download.geofabrik.de/europe/germany-latest.osm.pbf --output data/germany.osm.pbf
 ```
 
+`fetch` reuses the output file when it already exists, so repeating the same
+command does not download the extract again. Use `--force` to refresh it:
+
+```bash
+cargo run -- fetch geofabrik:europe/germany/baden-wuerttemberg --output data/bw.osm.pbf --force
+```
+
 Filter a local extract:
 
 ```bash
@@ -236,9 +243,8 @@ cargo test
 
 Tests cover Geofabrik shorthand parsing, JSON/YAML spec parsing, condition
 matching, bbox logic, field filtering, GeoJSON output, node indexes, and
-constructed-object relation assembly. A binary fixture test is intentionally not
-included yet because maintaining a tiny real `.osm.pbf` fixture adds repository
-weight and brittleness.
+constructed-object relation assembly. Fetch caching is covered by unit,
+integration, and CLI e2e tests using a local HTTP server.
 
 ## Roadmap
 

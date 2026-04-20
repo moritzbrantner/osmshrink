@@ -31,6 +31,10 @@ pub enum Commands {
         /// Output .osm.pbf path.
         #[arg(short, long)]
         output: PathBuf,
+
+        /// Redownload even when the output file already exists.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Filter a local .osm.pbf file into JSON, NDJSON, or GeoJSON.

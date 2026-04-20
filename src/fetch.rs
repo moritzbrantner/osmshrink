@@ -10,6 +10,7 @@ use crate::geofabrik::resolve_source;
 #[derive(Debug, Clone)]
 pub struct FetchOptions {
     pub show_progress: bool,
+    pub force: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -17,6 +18,7 @@ pub struct FetchReport {
     pub url: String,
     pub output: PathBuf,
     pub bytes_written: u64,
+    pub cached: bool,
 }
 
 pub async fn download_source(
@@ -30,6 +32,13 @@ pub async fn download_source(
 }
 
 pub async fn download_url(url: &str, output: &Path, options: &FetchOptions) -> Result<FetchReport> {
+    validate_pbf_output_path(output)?;
+    if !options.force {
+        if let Some(report) = cached_report(url, output).await? {
+            return Ok(report);
+        }
+    }
+
     if let Some(parent) = output
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -129,7 +138,32 @@ pub async fn download_url(url: &str, output: &Path, options: &FetchOptions) -> R
         url: url.to_owned(),
         output: output.to_path_buf(),
         bytes_written,
+        cached: false,
     })
+}
+
+async fn cached_report(url: &str, output: &Path) -> Result<Option<FetchReport>> {
+    let metadata = match tokio::fs::metadata(output).await {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(OsmshrinkError::ReadFile {
+                path: output.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+
+    Ok(Some(FetchReport {
+        url: url.to_owned(),
+        output: output.to_path_buf(),
+        bytes_written: metadata.len(),
+        cached: true,
+    }))
 }
 
 fn progress_bar(total: Option<u64>, show: bool) -> Option<ProgressBar> {
@@ -169,5 +203,47 @@ fn validate_pbf_output_path(path: &Path) -> Result<()> {
             path: path.to_path_buf(),
             expected: ".osm.pbf or .pbf",
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_pbf_output_extensions() {
+        assert!(validate_pbf_output_path(Path::new("extract.osm.pbf")).is_ok());
+        assert!(validate_pbf_output_path(Path::new("extract.pbf")).is_ok());
+        assert!(validate_pbf_output_path(Path::new("extract.osm")).is_err());
+    }
+
+    #[test]
+    fn derives_partial_path_next_to_output() {
+        assert_eq!(
+            partial_path(Path::new("data/extract.osm.pbf")),
+            PathBuf::from("data/extract.osm.pbf.part")
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_cached_report_for_existing_output() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let output = temp_dir.path().join("cached.osm.pbf");
+        tokio::fs::write(&output, b"already here").await.unwrap();
+
+        let report = download_url(
+            "http://127.0.0.1:9/never-requested.osm.pbf",
+            &output,
+            &FetchOptions {
+                show_progress: false,
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(report.cached);
+        assert_eq!(report.bytes_written, 12);
+        assert_eq!(tokio::fs::read(&output).await.unwrap(), b"already here");
     }
 }
