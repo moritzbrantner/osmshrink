@@ -73,6 +73,22 @@ mod tests {
     }
 
     #[test]
+    fn resolves_saarland_geofabrik_example() {
+        let source = parse_geofabrik("geofabrik:europe/germany/saarland").unwrap();
+        assert_eq!(source.region, "europe/germany/saarland");
+        assert_eq!(
+            source.url,
+            "https://download.geofabrik.de/europe/germany/saarland-latest.osm.pbf"
+        );
+
+        assert_eq!(
+            resolve_source("https://download.geofabrik.de/europe/germany/saarland-latest.osm.pbf")
+                .unwrap(),
+            "https://download.geofabrik.de/europe/germany/saarland-latest.osm.pbf"
+        );
+    }
+
+    #[test]
     fn rejects_invalid_geofabrik_shorthand() {
         assert!(parse_geofabrik("geofabrik:../planet").is_err());
         assert!(parse_geofabrik("geofabrik:europe//germany").is_err());

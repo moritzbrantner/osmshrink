@@ -246,6 +246,18 @@ matching, bbox logic, field filtering, GeoJSON output, node indexes, and
 constructed-object relation assembly. Fetch caching is covered by unit,
 integration, and CLI e2e tests using a local HTTP server.
 
+## Benchmarks
+
+Run the end-to-end filter benchmark:
+
+```bash
+cargo bench --bench filter
+```
+
+The benchmark generates a deterministic synthetic `.osm.pbf` fixture with
+20,000 nodes and 5,000 matching ways, then measures the real `filter_pbf`
+pipeline using the in-memory node index.
+
 ## Roadmap
 
 - Python and Node bindings over the Rust library core.

@@ -114,6 +114,14 @@ impl StoredCoordinate {
 
 pub trait NodeIndex {
     fn insert(&mut self, node_id: NodeId, coordinate: StoredCoordinate) -> Result<()>;
+
+    fn insert_batch(&mut self, entries: &[(NodeId, StoredCoordinate)]) -> Result<()> {
+        for (node_id, coordinate) in entries {
+            self.insert(*node_id, *coordinate)?;
+        }
+        Ok(())
+    }
+
     fn get(&self, node_id: NodeId) -> Result<Option<StoredCoordinate>>;
     fn backend(&self) -> IndexBackend;
     fn len(&self) -> usize;
@@ -141,6 +149,14 @@ impl MemoryNodeIndex {
 impl NodeIndex for MemoryNodeIndex {
     fn insert(&mut self, node_id: NodeId, coordinate: StoredCoordinate) -> Result<()> {
         self.nodes.insert(node_id, coordinate);
+        Ok(())
+    }
+
+    fn insert_batch(&mut self, entries: &[(NodeId, StoredCoordinate)]) -> Result<()> {
+        self.nodes.reserve(entries.len());
+        for (node_id, coordinate) in entries {
+            self.nodes.insert(*node_id, *coordinate);
+        }
         Ok(())
     }
 
@@ -211,6 +227,14 @@ impl RedbNodeIndex {
 
 impl NodeIndex for RedbNodeIndex {
     fn insert(&mut self, node_id: NodeId, coordinate: StoredCoordinate) -> Result<()> {
+        self.insert_batch(&[(node_id, coordinate)])
+    }
+
+    fn insert_batch(&mut self, entries: &[(NodeId, StoredCoordinate)]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
         let write_txn =
             self.database
                 .begin_write()
@@ -226,15 +250,18 @@ impl NodeIndex for RedbNodeIndex {
                         path: self.path.clone(),
                         details: source.to_string(),
                     })?;
-            if table
-                .insert(node_id.0, coordinate.to_bytes().as_slice())
-                .map_err(|source| OsmshrinkError::NodeIndex {
-                    path: self.path.clone(),
-                    details: source.to_string(),
-                })?
-                .is_none()
-            {
-                self.len += 1;
+            for (node_id, coordinate) in entries {
+                let bytes = coordinate.to_bytes();
+                if table
+                    .insert(node_id.0, bytes.as_slice())
+                    .map_err(|source| OsmshrinkError::NodeIndex {
+                        path: self.path.clone(),
+                        details: source.to_string(),
+                    })?
+                    .is_none()
+                {
+                    self.len += 1;
+                }
             }
         }
         write_txn
@@ -317,9 +344,8 @@ impl AutoNodeIndex {
             return Ok(());
         };
         let mut disk = RedbNodeIndex::create(&self.options)?;
-        for (node_id, coordinate) in memory.drain() {
-            disk.insert(node_id, coordinate)?;
-        }
+        let entries: Vec<_> = memory.drain().into_iter().collect();
+        disk.insert_batch(&entries)?;
         self.inner = AutoNodeIndexInner::Disk(disk);
         Ok(())
     }
@@ -338,6 +364,21 @@ impl NodeIndex for AutoNodeIndex {
                 Ok(())
             }
             AutoNodeIndexInner::Disk(disk) => disk.insert(node_id, coordinate),
+        }
+    }
+
+    fn insert_batch(&mut self, entries: &[(NodeId, StoredCoordinate)]) -> Result<()> {
+        match &mut self.inner {
+            AutoNodeIndexInner::Memory(memory) => {
+                memory.insert_batch(entries)?;
+                if self.options.mode == IndexMode::Auto
+                    && memory.len() > self.options.memory_node_limit
+                {
+                    self.spill_to_disk()?;
+                }
+                Ok(())
+            }
+            AutoNodeIndexInner::Disk(disk) => disk.insert_batch(entries),
         }
     }
 
@@ -421,6 +462,65 @@ mod tests {
     }
 
     #[test]
+    fn redb_index_batch_round_trips_coordinates() {
+        let options = IndexOptions {
+            mode: IndexMode::Disk,
+            memory_node_limit: 1,
+            disk_dir: None,
+        };
+        let mut index = RedbNodeIndex::create(&options).unwrap();
+        index
+            .insert_batch(&[
+                (NodeId(1), StoredCoordinate::new(10, 20)),
+                (NodeId(2), StoredCoordinate::new(30, 40)),
+                (NodeId(3), StoredCoordinate::new(50, 60)),
+            ])
+            .unwrap();
+
+        assert_eq!(index.len(), 3);
+        assert_eq!(
+            index.get(NodeId(1)).unwrap(),
+            Some(StoredCoordinate::new(10, 20))
+        );
+        assert_eq!(
+            index.get(NodeId(3)).unwrap(),
+            Some(StoredCoordinate::new(50, 60))
+        );
+    }
+
+    #[test]
+    fn batched_insert_replacement_preserves_len() {
+        let options = IndexOptions {
+            mode: IndexMode::Disk,
+            memory_node_limit: 1,
+            disk_dir: None,
+        };
+        let mut index = RedbNodeIndex::create(&options).unwrap();
+        index
+            .insert_batch(&[
+                (NodeId(1), StoredCoordinate::new(10, 20)),
+                (NodeId(2), StoredCoordinate::new(30, 40)),
+            ])
+            .unwrap();
+        index
+            .insert_batch(&[
+                (NodeId(1), StoredCoordinate::new(11, 22)),
+                (NodeId(2), StoredCoordinate::new(33, 44)),
+            ])
+            .unwrap();
+
+        assert_eq!(index.len(), 2);
+        assert_eq!(
+            index.get(NodeId(1)).unwrap(),
+            Some(StoredCoordinate::new(11, 22))
+        );
+        assert_eq!(
+            index.get(NodeId(2)).unwrap(),
+            Some(StoredCoordinate::new(33, 44))
+        );
+    }
+
+    #[test]
     fn auto_index_spills_after_threshold() {
         let options = IndexOptions {
             mode: IndexMode::Auto,
@@ -439,6 +539,30 @@ mod tests {
         assert_eq!(
             index.get(NodeId(1)).unwrap(),
             Some(StoredCoordinate::new(1, 1))
+        );
+    }
+
+    #[test]
+    fn auto_index_spills_when_batch_crosses_threshold() {
+        let options = IndexOptions {
+            mode: IndexMode::Auto,
+            memory_node_limit: 2,
+            disk_dir: None,
+        };
+        let mut index = AutoNodeIndex::create(options).unwrap();
+        index
+            .insert_batch(&[
+                (NodeId(1), StoredCoordinate::new(1, 1)),
+                (NodeId(2), StoredCoordinate::new(2, 2)),
+                (NodeId(3), StoredCoordinate::new(3, 3)),
+            ])
+            .unwrap();
+
+        assert_eq!(index.backend(), IndexBackend::Disk);
+        assert_eq!(index.len(), 3);
+        assert_eq!(
+            index.get(NodeId(2)).unwrap(),
+            Some(StoredCoordinate::new(2, 2))
         );
     }
 }

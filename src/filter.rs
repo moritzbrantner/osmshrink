@@ -18,6 +18,8 @@ use crate::spec::{
     ElementType, FilterSpec, GeometryMode, IncludeRules, OutputField, OutputFormat, TagCondition,
 };
 
+const NODE_INDEX_BATCH_SIZE: usize = 16_384;
+
 #[derive(Debug, Clone)]
 pub struct FilterRunOptions {
     pub input: PathBuf,
@@ -78,35 +80,36 @@ pub fn filter_pbf(options: FilterRunOptions) -> Result<FilterReport> {
     })?;
     let mut output = OutputWriter::create(&options.output, format)?;
     output.set_fields(compiled.fields.clone());
-    let mut node_index = AutoNodeIndex::create(options.index_options)?;
     let mut report = FilterReport::new(options.output.clone());
+    let includes_way = compiled.includes_type(ElementType::Way);
+    let includes_relation = compiled.includes_type(ElementType::Relation);
+    let needs_node_index = includes_way || includes_relation;
+    let mut node_index = if needs_node_index {
+        Some(AutoNodeIndex::create(options.index_options)?)
+    } else {
+        None
+    };
+    let mut candidates = Vec::new();
+    let mut required_way_ids = HashSet::new();
 
-    process_nodes_from_pbf(
+    process_first_pass_from_pbf(
         &options.input,
         &compiled,
-        &mut node_index,
+        node_index.as_mut().map(|index| index as &mut dyn NodeIndex),
         &mut output,
+        &mut candidates,
+        &mut required_way_ids,
         &mut report,
     )?;
 
-    let mut candidates = Vec::new();
-    let mut required_way_ids = HashSet::new();
-    if compiled.includes_type(ElementType::Relation) {
-        collect_relations_from_pbf(
-            &options.input,
-            &compiled,
-            &mut candidates,
-            &mut required_way_ids,
-            &mut report,
-        )?;
-    }
-
     let mut relation_way_geometries = HashMap::new();
-    if compiled.includes_type(ElementType::Way) || !required_way_ids.is_empty() {
+    if needs_node_index && (includes_way || !required_way_ids.is_empty()) {
         process_ways_from_pbf(
             &options.input,
             &compiled,
-            &node_index,
+            node_index
+                .as_ref()
+                .expect("node index exists when ways are processed"),
             &required_way_ids,
             &mut relation_way_geometries,
             &mut output,
@@ -114,7 +117,7 @@ pub fn filter_pbf(options: FilterRunOptions) -> Result<FilterReport> {
         )?;
     }
 
-    if compiled.includes_type(ElementType::Relation) {
+    if includes_relation {
         emit_relations(
             &compiled,
             &candidates,
@@ -124,46 +127,18 @@ pub fn filter_pbf(options: FilterRunOptions) -> Result<FilterReport> {
         )?;
     }
 
-    report.index_backend = node_index.backend();
+    if let Some(node_index) = &node_index {
+        report.index_backend = node_index.backend();
+    }
     output.finish()?;
     Ok(report)
 }
 
-fn process_nodes_from_pbf(
+fn process_first_pass_from_pbf(
     input: &std::path::Path,
     compiled: &CompiledFilter,
-    node_index: &mut dyn NodeIndex,
+    mut node_index: Option<&mut dyn NodeIndex>,
     sink: &mut dyn FeatureSink,
-    report: &mut FilterReport,
-) -> Result<()> {
-    let file = File::open(input).map_err(|source| OsmshrinkError::ReadFile {
-        path: input.to_path_buf(),
-        source,
-    })?;
-    let mut reader = OsmPbfReader::new(file);
-    for object in reader.iter() {
-        let object = object.map_err(|source| OsmshrinkError::Pbf {
-            path: input.to_path_buf(),
-            source,
-        })?;
-        if let OsmObj::Node(node) = object {
-            process_node(
-                node.id,
-                StoredCoordinate::new(node.decimicro_lon, node.decimicro_lat),
-                &node.tags,
-                compiled,
-                node_index,
-                sink,
-                report,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn collect_relations_from_pbf(
-    input: &std::path::Path,
-    compiled: &CompiledFilter,
     candidates: &mut Vec<CandidateRelation>,
     required_way_ids: &mut HashSet<WayId>,
     report: &mut FilterReport,
@@ -173,16 +148,141 @@ fn collect_relations_from_pbf(
         source,
     })?;
     let mut reader = OsmPbfReader::new(file);
+    let mut node_batch = Vec::with_capacity(NODE_INDEX_BATCH_SIZE);
+    let mut node_features = Vec::new();
+    let should_index_nodes = node_index.is_some();
+
     for object in reader.iter() {
         let object = object.map_err(|source| OsmshrinkError::Pbf {
             path: input.to_path_buf(),
             source,
         })?;
-        if let OsmObj::Relation(relation) = object {
-            collect_relation(relation, compiled, candidates, required_way_ids, report);
+        match object {
+            OsmObj::Node(node) => {
+                process_node(
+                    node.id,
+                    StoredCoordinate::new(node.decimicro_lon, node.decimicro_lat),
+                    &node.tags,
+                    NodeProcessingContext {
+                        compiled,
+                        should_index_node: should_index_nodes,
+                        node_batch: &mut node_batch,
+                        node_features: &mut node_features,
+                        report,
+                    },
+                );
+                if node_batch.len() >= NODE_INDEX_BATCH_SIZE {
+                    if let Some(index) = node_index.as_mut() {
+                        flush_indexed_node_batch(
+                            &mut **index,
+                            &mut node_batch,
+                            &mut node_features,
+                            sink,
+                        )?;
+                    }
+                } else if !should_index_nodes {
+                    flush_node_features(&mut node_features, sink)?;
+                }
+            }
+            OsmObj::Relation(relation) if compiled.includes_type(ElementType::Relation) => {
+                collect_relation(relation, compiled, candidates, required_way_ids, report);
+            }
+            _ => {}
         }
     }
+
+    if let Some(index) = node_index.as_mut() {
+        flush_indexed_node_batch(&mut **index, &mut node_batch, &mut node_features, sink)?;
+    }
+    flush_node_features(&mut node_features, sink)?;
     Ok(())
+}
+
+fn flush_indexed_node_batch(
+    node_index: &mut dyn NodeIndex,
+    node_batch: &mut Vec<(NodeId, StoredCoordinate)>,
+    node_features: &mut Vec<Feature>,
+    sink: &mut dyn FeatureSink,
+) -> Result<()> {
+    if !node_batch.is_empty() {
+        node_index.insert_batch(node_batch)?;
+        node_batch.clear();
+    }
+    flush_node_features(node_features, sink)
+}
+
+fn flush_node_features(node_features: &mut Vec<Feature>, sink: &mut dyn FeatureSink) -> Result<()> {
+    for feature in node_features.drain(..) {
+        sink.write_feature(feature)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn process_node_for_test(
+    node_id: NodeId,
+    coordinate: StoredCoordinate,
+    tags: &Tags,
+    compiled: &CompiledFilter,
+    node_index: &mut dyn NodeIndex,
+    sink: &mut dyn FeatureSink,
+    report: &mut FilterReport,
+) -> Result<()> {
+    let mut node_batch = Vec::with_capacity(1);
+    let mut node_features = Vec::new();
+    process_node(
+        node_id,
+        coordinate,
+        tags,
+        NodeProcessingContext {
+            compiled,
+            should_index_node: true,
+            node_batch: &mut node_batch,
+            node_features: &mut node_features,
+            report,
+        },
+    );
+    node_index.insert_batch(&node_batch)?;
+    flush_node_features(&mut node_features, sink)
+}
+
+struct NodeProcessingContext<'a> {
+    compiled: &'a CompiledFilter,
+    should_index_node: bool,
+    node_batch: &'a mut Vec<(NodeId, StoredCoordinate)>,
+    node_features: &'a mut Vec<Feature>,
+    report: &'a mut FilterReport,
+}
+
+fn process_node(
+    node_id: NodeId,
+    coordinate: StoredCoordinate,
+    tags: &Tags,
+    context: NodeProcessingContext<'_>,
+) {
+    if context.should_index_node {
+        context.node_batch.push((node_id, coordinate));
+    }
+
+    if !context.compiled.includes_type(ElementType::Node) {
+        return;
+    }
+
+    let coordinate = coordinate.to_coordinate();
+    if !context.compiled.matches_node_bbox(coordinate) {
+        return;
+    }
+
+    let tags = normalize_tags(tags);
+    if context.compiled.matches_node_tags(&tags) {
+        context.node_features.push(Feature {
+            id: node_id.0,
+            kind: ElementKind::Node,
+            tags,
+            geometry: point(coordinate),
+        });
+        context.report.objects_written += 1;
+    }
 }
 
 fn process_ways_from_pbf(
@@ -215,31 +315,6 @@ fn process_ways_from_pbf(
                 report,
             )?;
         }
-    }
-    Ok(())
-}
-
-fn process_node(
-    node_id: NodeId,
-    coordinate: StoredCoordinate,
-    tags: &Tags,
-    compiled: &CompiledFilter,
-    node_index: &mut dyn NodeIndex,
-    sink: &mut dyn FeatureSink,
-    report: &mut FilterReport,
-) -> Result<()> {
-    node_index.insert(node_id, coordinate)?;
-
-    let coordinate = coordinate.to_coordinate();
-    let tags = normalize_tags(tags);
-    if compiled.matches_node(&tags, coordinate) {
-        sink.write_feature(Feature {
-            id: node_id.0,
-            kind: ElementKind::Node,
-            tags,
-            geometry: point(coordinate),
-        })?;
-        report.objects_written += 1;
     }
     Ok(())
 }
@@ -299,7 +374,7 @@ fn process_way(
     sink: &mut dyn FeatureSink,
     report: &mut FilterReport,
 ) -> Result<()> {
-    let coordinates = match coordinates_for_way(&way.nodes, node_index)? {
+    let mut coordinates = match coordinates_for_way(&way.nodes, node_index)? {
         Some(coordinates) => coordinates,
         None => {
             if compiled.includes_type(ElementType::Way) {
@@ -313,20 +388,23 @@ fn process_way(
         }
     };
 
-    if required_way_ids.contains(&way.id) {
-        relation_way_geometries.insert(way.id, coordinates.clone());
+    if compiled.includes_type(ElementType::Way) {
+        let tags = normalize_tags(&way.tags);
+        if compiled.matches_way(&tags, &coordinates) {
+            sink.write_feature(Feature {
+                id: way.id.0,
+                kind: ElementKind::Way,
+                tags,
+                geometry: way_geometry(&coordinates, way.is_closed(), compiled.geometry_mode),
+            })?;
+            report.objects_written += 1;
+        }
     }
 
-    let tags = normalize_tags(&way.tags);
-    if compiled.matches_way(&tags, &coordinates) {
-        sink.write_feature(Feature {
-            id: way.id.0,
-            kind: ElementKind::Way,
-            tags,
-            geometry: way_geometry(&coordinates, way.is_closed(), compiled.geometry_mode),
-        })?;
-        report.objects_written += 1;
+    if required_way_ids.contains(&way.id) {
+        relation_way_geometries.insert(way.id, std::mem::take(&mut coordinates));
     }
+
     Ok(())
 }
 
@@ -651,11 +729,18 @@ impl CompiledFilter {
 
     pub fn matches_node(&self, tags: &NormalizedTags, coordinate: Coordinate) -> bool {
         self.types.contains(&ElementType::Node)
-            && self.matches_tags(tags)
-            && self
-                .bbox
-                .map(|bbox| bbox.contains(coordinate))
-                .unwrap_or(true)
+            && self.matches_node_tags(tags)
+            && self.matches_node_bbox(coordinate)
+    }
+
+    fn matches_node_tags(&self, tags: &NormalizedTags) -> bool {
+        self.types.contains(&ElementType::Node) && self.matches_tags(tags)
+    }
+
+    fn matches_node_bbox(&self, coordinate: Coordinate) -> bool {
+        self.bbox
+            .map(|bbox| bbox.contains(coordinate))
+            .unwrap_or(true)
     }
 
     pub fn matches_way(&self, tags: &NormalizedTags, coordinates: &[Coordinate]) -> bool {
@@ -675,9 +760,7 @@ impl CompiledFilter {
         self.types.contains(&ElementType::Relation)
             && self
                 .bbox
-                .map(|bbox| {
-                    geometry_coordinates(geometry).any(|coordinate| bbox.contains(coordinate))
-                })
+                .map(|bbox| geometry_intersects_bbox(geometry, bbox))
                 .unwrap_or(true)
     }
 
@@ -701,24 +784,28 @@ impl CompiledFilter {
     }
 }
 
-fn geometry_coordinates(geometry: &Geometry) -> Box<dyn Iterator<Item = Coordinate> + '_> {
+fn geometry_intersects_bbox(geometry: &Geometry, bbox: BBox) -> bool {
     match geometry {
-        Geometry::Point { coordinates } => Box::new(std::iter::once((*coordinates).into())),
-        Geometry::LineString { coordinates } => {
-            Box::new(coordinates.iter().copied().map(Coordinate::from))
-        }
-        Geometry::Polygon { coordinates } => Box::new(
-            coordinates
-                .iter()
-                .flat_map(|ring| ring.iter().copied().map(Coordinate::from)),
-        ),
-        Geometry::MultiPolygon { coordinates } => {
-            Box::new(coordinates.iter().flat_map(|polygon| {
-                polygon
-                    .iter()
-                    .flat_map(|ring| ring.iter().copied().map(Coordinate::from))
-            }))
-        }
+        Geometry::Point { coordinates } => bbox.contains((*coordinates).into()),
+        Geometry::LineString { coordinates } => coordinates
+            .iter()
+            .copied()
+            .map(Coordinate::from)
+            .any(|coordinate| bbox.contains(coordinate)),
+        Geometry::Polygon { coordinates } => coordinates.iter().any(|ring| {
+            ring.iter()
+                .copied()
+                .map(Coordinate::from)
+                .any(|coordinate| bbox.contains(coordinate))
+        }),
+        Geometry::MultiPolygon { coordinates } => coordinates.iter().any(|polygon| {
+            polygon.iter().any(|ring| {
+                ring.iter()
+                    .copied()
+                    .map(Coordinate::from)
+                    .any(|coordinate| bbox.contains(coordinate))
+            })
+        }),
     }
 }
 
@@ -868,7 +955,7 @@ mod tests {
 
         for object in objects {
             if let OsmObj::Node(node) = object {
-                process_node(
+                process_node_for_test(
                     node.id,
                     StoredCoordinate::new(node.decimicro_lon, node.decimicro_lat),
                     &node.tags,
