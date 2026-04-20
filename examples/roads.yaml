@@ -1,0 +1,16 @@
+source:
+  provider: geofabrik
+  region: europe/germany/baden-wuerttemberg
+filter:
+  types: [way]
+  include:
+    any:
+      - key: highway
+        values: [primary, secondary, tertiary]
+  exclude:
+    - key: access
+      values: [private]
+output:
+  format: ndjson
+  geometry: full
+  fields: [id, type, tags, geometry]

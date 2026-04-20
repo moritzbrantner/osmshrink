@@ -1,0 +1,22 @@
+{
+  "source": {
+    "provider": "geofabrik",
+    "region": "europe/germany/baden-wuerttemberg"
+  },
+  "filter": {
+    "types": ["node", "way"],
+    "include": {
+      "any": [
+        { "key": "amenity", "values": ["school", "hospital"] }
+      ],
+      "all": [
+        { "key": "name", "exists": true }
+      ]
+    }
+  },
+  "output": {
+    "format": "ndjson",
+    "geometry": "full",
+    "fields": ["id", "type", "tags", "geometry"]
+  }
+}
