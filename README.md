@@ -63,6 +63,16 @@ cargo run -- filter --input data/bw.osm.pbf --spec examples/roads.yaml --format 
 cargo run -- filter --input data/bw.osm.pbf --spec examples/areas_geojson.yaml --output out/areas.geojson
 ```
 
+You can also pass the filter on the command line, similar to `jq`, or use
+`--filter-file`/`-f` as an alias for `--spec`:
+
+```bash
+cargo run -- filter --input data/bw.osm.pbf --output out/schools.ndjson 'amenity=school'
+cargo run -- filter --input data/bw.osm.pbf --output out/schools.ndjson '{key: amenity, value: school}'
+cargo run -- filter --input data/bw.osm.pbf --output out/roads.ndjson '{types: [way], include: {any: [{key: highway, values: [primary, secondary]}]}}'
+cargo run -- filter --input data/bw.osm.pbf -f examples/schools.json --output out/schools.ndjson
+```
+
 Fetch and filter in one command:
 
 ```bash
@@ -82,6 +92,7 @@ Validate a spec:
 
 ```bash
 cargo run -- validate-spec --spec examples/schools.json
+cargo run -- validate-spec '{key: amenity, value: school}'
 ```
 
 Use `--verbose` for more logging and `--quiet` to suppress status output. Use
@@ -147,6 +158,11 @@ Supported condition operators:
 
 If `include` is omitted, objects pass tag filtering unless excluded. If both
 `include.any` and `include.all` are present, both groups must pass.
+
+Inline filters can be a full JSON/YAML spec, just the `filter` rules object, a
+single tag condition, or a list of tag conditions. A single condition or list is
+treated as `include.all`. For quick tag matches, `key=value`, `key!=value`,
+`key~regex`, and `key` are accepted as shorthand conditions.
 
 BBox behavior:
 
@@ -224,6 +240,32 @@ The crate is split into a reusable library and a CLI:
 - `output`: JSON, NDJSON, and GeoJSON writers.
 - `inspect`: cheap filesystem-level input inspection.
 - `error`: typed application errors.
+
+## Library Use
+
+The emitted data model is available as Rust structs:
+
+```rust
+use osmshrink::{CollectRunOptions, FilterSpec, collect_pbf};
+use osmshrink::index::IndexOptions;
+
+let spec = FilterSpec::from_inline("amenity=school")?;
+let index_options = IndexOptions::from_spec(&spec.processing.index);
+let collected = collect_pbf(CollectRunOptions {
+    input: "data/bw.osm.pbf".into(),
+    spec,
+    index_options,
+})?;
+
+for feature in collected.features {
+    println!("{} {:?}", feature.id, feature.tags);
+}
+# Ok::<(), osmshrink::OsmshrinkError>(())
+```
+
+`Feature`, `ElementKind`, `Geometry`, and `Tags` are public and support serde
+serialization/deserialization, so JSON output can also be read directly into
+`Vec<osmshrink::Feature>` when using array JSON.
 
 ## Limitations
 

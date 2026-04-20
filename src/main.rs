@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::Parser;
 use osmshrink::cli::{Cli, Commands};
 use osmshrink::fetch::{FetchOptions, download_source};
@@ -43,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Filter {
+            filter,
             input,
             spec,
             output,
@@ -51,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
             index_dir,
             memory_node_limit,
         } => {
-            let spec = FilterSpec::from_path(&spec)?;
+            let spec = read_spec_input(spec, filter)?;
             let mut index_options = IndexOptions::from_spec(&spec.processing.index);
             index_options.apply_overrides(index, index_dir, memory_node_limit)?;
             let report = filter_pbf(FilterRunOptions {
@@ -66,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Run {
+            filter,
             source,
             spec,
             output,
@@ -92,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let spec = FilterSpec::from_path(&spec)?;
+            let spec = read_spec_input(spec, filter)?;
             let mut index_options = IndexOptions::from_spec(&spec.processing.index);
             index_options.apply_overrides(index, index_dir, memory_node_limit)?;
             let report = filter_pbf(FilterRunOptions {
@@ -110,8 +114,8 @@ async fn main() -> anyhow::Result<()> {
             let report = inspect_path(&input)?;
             println!("{report}");
         }
-        Commands::ValidateSpec { spec } => {
-            let spec = FilterSpec::from_path(&spec)?;
+        Commands::ValidateSpec { filter, spec } => {
+            let spec = read_spec_input(spec, filter)?;
             spec.validate()?;
             if !cli.quiet {
                 println!("Spec is valid.");
@@ -120,6 +124,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn read_spec_input(spec: Option<PathBuf>, filter: Option<String>) -> anyhow::Result<FilterSpec> {
+    match (spec, filter) {
+        (Some(path), None) => Ok(FilterSpec::from_path(&path)?),
+        (None, Some(filter)) => Ok(FilterSpec::from_filter_arg(&filter)?),
+        (None, None) => Err(anyhow::anyhow!(
+            "missing filter input: pass an inline FILTER or use --spec <FILE>"
+        )),
+        (Some(_), Some(_)) => Err(anyhow::anyhow!(
+            "pass either an inline FILTER or --spec <FILE>, not both"
+        )),
+    }
 }
 
 fn print_filter_report(report: &osmshrink::filter::FilterReport) {

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::geometry::Geometry;
@@ -8,7 +8,7 @@ use crate::spec::OutputField;
 
 pub type Tags = BTreeMap<String, String>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ElementKind {
     Node,
@@ -26,7 +26,7 @@ impl ElementKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Feature {
     pub id: i64,
     #[serde(rename = "type")]
@@ -88,5 +88,18 @@ mod tests {
         assert!(value.get("geometry").is_some());
         assert!(value.get("type").is_none());
         assert!(value.get("tags").is_none());
+    }
+
+    #[test]
+    fn deserializes_feature_from_json() {
+        let feature: Feature = serde_json::from_str(
+            r#"{"id":123,"type":"node","tags":{"name":"Test"},"geometry":{"type":"Point","coordinates":[8.7,48.9]}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(feature.id, 123);
+        assert_eq!(feature.kind, ElementKind::Node);
+        assert_eq!(feature.tags["name"], "Test");
+        assert!(matches!(feature.geometry, Geometry::Point { .. }));
     }
 }

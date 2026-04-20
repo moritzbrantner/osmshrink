@@ -39,13 +39,17 @@ pub enum Commands {
 
     /// Filter a local .osm.pbf file into JSON, NDJSON, or GeoJSON.
     Filter {
+        /// Inline JSON/YAML filter, filter rules, tag condition, or spec path.
+        #[arg(value_name = "FILTER", conflicts_with = "spec")]
+        filter: Option<String>,
+
         /// Input .osm.pbf path.
         #[arg(short, long)]
         input: PathBuf,
 
-        /// JSON or YAML filter spec.
-        #[arg(short, long)]
-        spec: PathBuf,
+        /// JSON or YAML filter spec file.
+        #[arg(short, long, visible_alias = "filter-file", visible_short_alias = 'f')]
+        spec: Option<PathBuf>,
 
         /// Output .json, .ndjson, or .geojson path.
         #[arg(short, long)]
@@ -70,13 +74,17 @@ pub enum Commands {
 
     /// Fetch and filter in one command.
     Run {
+        /// Inline JSON/YAML filter, filter rules, tag condition, or spec path.
+        #[arg(value_name = "FILTER", conflicts_with = "spec")]
+        filter: Option<String>,
+
         /// Direct URL or shorthand source.
         #[arg(short, long)]
         source: String,
 
-        /// JSON or YAML filter spec.
-        #[arg(short, long)]
-        spec: PathBuf,
+        /// JSON or YAML filter spec file.
+        #[arg(short, long, visible_alias = "filter-file", visible_short_alias = 'f')]
+        spec: Option<PathBuf>,
 
         /// Output .json, .ndjson, or .geojson path.
         #[arg(short, long)]
@@ -108,8 +116,12 @@ pub enum Commands {
 
     /// Validate a JSON or YAML filter spec.
     ValidateSpec {
-        /// JSON or YAML filter spec.
-        #[arg(short, long)]
-        spec: PathBuf,
+        /// Inline JSON/YAML filter, filter rules, tag condition, or spec path.
+        #[arg(value_name = "FILTER", conflicts_with = "spec")]
+        filter: Option<String>,
+
+        /// JSON or YAML filter spec file.
+        #[arg(short, long, visible_alias = "filter-file", visible_short_alias = 'f')]
+        spec: Option<PathBuf>,
     },
 }

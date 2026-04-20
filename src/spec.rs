@@ -23,6 +23,17 @@ pub struct FilterSpec {
     pub output: OutputSpec,
 }
 
+impl Default for FilterSpec {
+    fn default() -> Self {
+        Self {
+            source: None,
+            filter: FilterRules::default(),
+            processing: ProcessingSpec::default(),
+            output: OutputSpec::default(),
+        }
+    }
+}
+
 impl FilterSpec {
     pub fn from_path(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path).map_err(|source| OsmshrinkError::ReadFile {
@@ -51,6 +62,64 @@ impl FilterSpec {
         Ok(spec)
     }
 
+    pub fn from_filter_arg(input: &str) -> Result<Self> {
+        let path = Path::new(input);
+        if path.exists() || looks_like_spec_path(path) {
+            Self::from_path(path)
+        } else {
+            Self::from_inline(input)
+        }
+    }
+
+    pub fn from_inline(input: &str) -> Result<Self> {
+        let input = input.trim();
+        if input.is_empty() {
+            return Err(OsmshrinkError::InvalidSpec(
+                "inline filter must not be empty".to_owned(),
+            ));
+        }
+
+        if let Ok(spec) = parse_inline::<FilterSpec>(input) {
+            return Ok(spec);
+        }
+
+        if let Ok(filter) = parse_inline::<FilterRules>(input) {
+            return Ok(Self {
+                filter,
+                ..Self::default()
+            });
+        }
+
+        if let Ok(condition) = parse_inline::<TagCondition>(input) {
+            return Ok(Self::from_include_all(vec![condition]));
+        }
+
+        if let Ok(conditions) = parse_inline::<Vec<TagCondition>>(input) {
+            return Ok(Self::from_include_all(conditions));
+        }
+
+        if let Some(condition) = parse_tag_condition_expression(input) {
+            return Ok(Self::from_include_all(vec![condition]));
+        }
+
+        Err(OsmshrinkError::InvalidSpec(
+            "inline filter must be a JSON/YAML filter spec, filter rules object, tag condition, list of tag conditions, or key=value condition".to_owned(),
+        ))
+    }
+
+    fn from_include_all(conditions: Vec<TagCondition>) -> Self {
+        Self {
+            filter: FilterRules {
+                include: Some(IncludeRules {
+                    all: conditions,
+                    any: Vec::new(),
+                }),
+                ..FilterRules::default()
+            },
+            ..Self::default()
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if let Some(source) = &self.source {
             source.validate()?;
@@ -59,6 +128,77 @@ impl FilterSpec {
         self.processing.validate()?;
         self.output.validate()?;
         Ok(())
+    }
+}
+
+fn looks_like_spec_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("json" | "yaml" | "yml")
+    )
+}
+
+fn parse_inline<T>(input: &str) -> std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_json::from_str(input)
+        .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+        .or_else(|_| {
+            serde_yaml::from_str(input)
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+        })
+}
+
+fn parse_tag_condition_expression(input: &str) -> Option<TagCondition> {
+    let input = input.trim();
+    if input.starts_with('{') || input.starts_with('[') || input.is_empty() {
+        return None;
+    }
+
+    for (operator, negate) in [("!=", true), ("=", false)] {
+        if let Some((key, value)) = input.split_once(operator) {
+            let key = parse_expression_key(key)?;
+            return Some(TagCondition {
+                key,
+                exists: None,
+                value: Some(value.trim().to_owned()),
+                values: None,
+                regex: None,
+                negate,
+            });
+        }
+    }
+
+    if let Some((key, pattern)) = input.split_once('~') {
+        let key = parse_expression_key(key)?;
+        return Some(TagCondition {
+            key,
+            exists: None,
+            value: None,
+            values: None,
+            regex: Some(pattern.trim().to_owned()),
+            negate: false,
+        });
+    }
+
+    let key = parse_expression_key(input)?;
+    Some(TagCondition {
+        key,
+        exists: Some(true),
+        value: None,
+        values: None,
+        regex: None,
+        negate: false,
+    })
+}
+
+fn parse_expression_key(key: &str) -> Option<String> {
+    let key = key.trim();
+    if key.is_empty() || key.chars().any(char::is_whitespace) {
+        None
+    } else {
+        Some(key.to_owned())
     }
 }
 
@@ -458,6 +598,45 @@ output:
             spec.processing.index.disk_dir,
             Some(PathBuf::from("/tmp/osmshrink-index"))
         );
+    }
+
+    #[test]
+    fn parses_inline_full_filter_spec() {
+        let spec =
+            FilterSpec::from_inline(r#"{"filter":{"types":["node"]},"output":{"format":"json"}}"#)
+                .unwrap();
+        spec.validate().unwrap();
+        assert_eq!(spec.filter.types, Some(vec![ElementType::Node]));
+        assert_eq!(spec.output.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn parses_inline_filter_rules() {
+        let spec = FilterSpec::from_inline(
+            r#"{types: [way], include: {any: [{key: highway, value: primary}]}}"#,
+        )
+        .unwrap();
+        spec.validate().unwrap();
+        assert_eq!(spec.filter.types, Some(vec![ElementType::Way]));
+        assert_eq!(spec.filter.include.unwrap().any[0].key, "highway");
+    }
+
+    #[test]
+    fn parses_inline_tag_condition_as_include_all() {
+        let spec = FilterSpec::from_inline(r#"{key: amenity, value: school}"#).unwrap();
+        spec.validate().unwrap();
+        let include = spec.filter.include.unwrap();
+        assert_eq!(include.all[0].key, "amenity");
+        assert_eq!(include.all[0].value.as_deref(), Some("school"));
+    }
+
+    #[test]
+    fn parses_inline_key_value_expression_as_tag_condition() {
+        let spec = FilterSpec::from_inline("amenity=school").unwrap();
+        spec.validate().unwrap();
+        let include = spec.filter.include.unwrap();
+        assert_eq!(include.all[0].key, "amenity");
+        assert_eq!(include.all[0].value.as_deref(), Some("school"));
     }
 
     #[test]

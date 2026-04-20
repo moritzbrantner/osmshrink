@@ -30,6 +30,44 @@ pub struct FilterRunOptions {
 }
 
 #[derive(Debug, Clone)]
+pub struct CollectRunOptions {
+    pub input: PathBuf,
+    pub spec: FilterSpec,
+    pub index_options: IndexOptions,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollectedFeatures {
+    pub features: Vec<Feature>,
+    pub report: CollectReport,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollectReport {
+    pub objects_collected: u64,
+    pub ways_skipped_missing_nodes: u64,
+    pub relations_skipped_non_area: u64,
+    pub relations_skipped_missing_members: u64,
+    pub relations_skipped_invalid_rings: u64,
+    pub relation_members_ignored_role: u64,
+    pub index_backend: IndexBackend,
+}
+
+impl From<FilterReport> for CollectReport {
+    fn from(report: FilterReport) -> Self {
+        Self {
+            objects_collected: report.objects_written,
+            ways_skipped_missing_nodes: report.ways_skipped_missing_nodes,
+            relations_skipped_non_area: report.relations_skipped_non_area,
+            relations_skipped_missing_members: report.relations_skipped_missing_members,
+            relations_skipped_invalid_rings: report.relations_skipped_invalid_rings,
+            relation_members_ignored_role: report.relation_members_ignored_role,
+            index_backend: report.index_backend,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct FilterReport {
     pub output: PathBuf,
     pub objects_written: u64,
@@ -58,8 +96,6 @@ impl FilterReport {
 
 pub fn filter_pbf(options: FilterRunOptions) -> Result<FilterReport> {
     validate_input_path(&options.input)?;
-    options.spec.validate()?;
-
     let format = options
         .format_override
         .unwrap_or(options.spec.output.format);
@@ -74,18 +110,58 @@ pub fn filter_pbf(options: FilterRunOptions) -> Result<FilterReport> {
         )));
     }
 
-    let compiled = CompiledFilter::compile(&FilterSpec {
+    let effective_spec = FilterSpec {
         output: effective_output.clone(),
         ..options.spec.clone()
-    })?;
+    };
+    let compiled = CompiledFilter::compile(&effective_spec)?;
     let mut output = OutputWriter::create(&options.output, format)?;
     output.set_fields(compiled.fields.clone());
     let mut report = FilterReport::new(options.output.clone());
+
+    run_filter_pipeline(
+        &options.input,
+        &compiled,
+        options.index_options,
+        &mut output,
+        &mut report,
+    )?;
+    output.finish()?;
+    Ok(report)
+}
+
+pub fn collect_pbf(options: CollectRunOptions) -> Result<CollectedFeatures> {
+    validate_input_path(&options.input)?;
+    let compiled = CompiledFilter::compile(&options.spec)?;
+    let mut sink = VecFeatureSink::new();
+    let mut report = FilterReport::new(PathBuf::from("<memory>"));
+
+    run_filter_pipeline(
+        &options.input,
+        &compiled,
+        options.index_options,
+        &mut sink,
+        &mut report,
+    )?;
+
+    Ok(CollectedFeatures {
+        features: sink.features,
+        report: report.into(),
+    })
+}
+
+fn run_filter_pipeline(
+    input: &std::path::Path,
+    compiled: &CompiledFilter,
+    index_options: IndexOptions,
+    sink: &mut dyn FeatureSink,
+    report: &mut FilterReport,
+) -> Result<()> {
     let includes_way = compiled.includes_type(ElementType::Way);
     let includes_relation = compiled.includes_type(ElementType::Relation);
     let needs_node_index = includes_way || includes_relation;
     let mut node_index = if needs_node_index {
-        Some(AutoNodeIndex::create(options.index_options)?)
+        Some(AutoNodeIndex::create(index_options)?)
     } else {
         None
     };
@@ -93,45 +169,44 @@ pub fn filter_pbf(options: FilterRunOptions) -> Result<FilterReport> {
     let mut required_way_ids = HashSet::new();
 
     process_first_pass_from_pbf(
-        &options.input,
-        &compiled,
+        input,
+        compiled,
         node_index.as_mut().map(|index| index as &mut dyn NodeIndex),
-        &mut output,
+        sink,
         &mut candidates,
         &mut required_way_ids,
-        &mut report,
+        report,
     )?;
 
     let mut relation_way_geometries = HashMap::new();
     if needs_node_index && (includes_way || !required_way_ids.is_empty()) {
         process_ways_from_pbf(
-            &options.input,
-            &compiled,
+            input,
+            compiled,
             node_index
                 .as_ref()
                 .expect("node index exists when ways are processed"),
             &required_way_ids,
             &mut relation_way_geometries,
-            &mut output,
-            &mut report,
+            sink,
+            report,
         )?;
     }
 
     if includes_relation {
         emit_relations(
-            &compiled,
+            compiled,
             &candidates,
             &relation_way_geometries,
-            &mut output,
-            &mut report,
+            sink,
+            report,
         )?;
     }
 
     if let Some(node_index) = &node_index {
         report.index_backend = node_index.backend();
     }
-    output.finish()?;
-    Ok(report)
+    Ok(())
 }
 
 fn process_first_pass_from_pbf(
@@ -487,13 +562,11 @@ impl FeatureSink for OutputWriter {
     }
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone)]
 struct VecFeatureSink {
     features: Vec<Feature>,
 }
 
-#[cfg(test)]
 impl VecFeatureSink {
     fn new() -> Self {
         Self {
@@ -502,7 +575,6 @@ impl VecFeatureSink {
     }
 }
 
-#[cfg(test)]
 impl FeatureSink for VecFeatureSink {
     fn write_feature(&mut self, feature: Feature) -> Result<()> {
         self.features.push(feature);
