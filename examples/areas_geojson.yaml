@@ -1,0 +1,20 @@
+source:
+  provider: geofabrik
+  region: europe/germany/baden-wuerttemberg
+filter:
+  types: [relation]
+  include:
+    any:
+      - key: type
+        values: [multipolygon, boundary]
+    all:
+      - key: name
+        exists: true
+processing:
+  index:
+    mode: auto
+    memory_node_limit: 5000000
+output:
+  format: geojson
+  geometry: polygon
+  fields: [id, type, tags, geometry]

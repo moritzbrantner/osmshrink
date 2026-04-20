@@ -13,6 +13,7 @@ pub type Tags = BTreeMap<String, String>;
 pub enum ElementKind {
     Node,
     Way,
+    Relation,
 }
 
 impl ElementKind {
@@ -20,6 +21,7 @@ impl ElementKind {
         match self {
             Self::Node => "node",
             Self::Way => "way",
+            Self::Relation => "relation",
         }
     }
 }

@@ -18,6 +18,8 @@ pub struct FilterSpec {
     #[serde(default)]
     pub filter: FilterRules,
     #[serde(default)]
+    pub processing: ProcessingSpec,
+    #[serde(default)]
     pub output: OutputSpec,
 }
 
@@ -54,6 +56,7 @@ impl FilterSpec {
             source.validate()?;
         }
         self.filter.validate()?;
+        self.processing.validate()?;
         self.output.validate()?;
         Ok(())
     }
@@ -124,10 +127,6 @@ impl FilterRules {
                 "filter.types must not be empty".to_owned(),
             ));
         }
-        if types.contains(&ElementType::Relation) {
-            return Err(OsmshrinkError::UnsupportedRelations);
-        }
-
         if let Some(include) = &self.include {
             include.validate()?;
         }
@@ -139,20 +138,11 @@ impl FilterRules {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IncludeRules {
     pub any: Vec<TagCondition>,
     pub all: Vec<TagCondition>,
-}
-
-impl Default for IncludeRules {
-    fn default() -> Self {
-        Self {
-            any: Vec::new(),
-            all: Vec::new(),
-        }
-    }
 }
 
 impl IncludeRules {
@@ -201,13 +191,13 @@ impl TagCondition {
             )));
         }
 
-        if let Some(values) = &self.values {
-            if values.is_empty() {
-                return Err(OsmshrinkError::InvalidSpec(format!(
-                    "condition values for key `{}` must not be empty",
-                    self.key
-                )));
-            }
+        if let Some(values) = &self.values
+            && values.is_empty()
+        {
+            return Err(OsmshrinkError::InvalidSpec(format!(
+                "condition values for key `{}` must not be empty",
+                self.key
+            )));
         }
 
         if let Some(pattern) = &self.regex {
@@ -228,6 +218,57 @@ pub enum ElementType {
     Node,
     Way,
     Relation,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProcessingSpec {
+    pub index: IndexSpec,
+}
+
+impl ProcessingSpec {
+    pub fn validate(&self) -> Result<()> {
+        self.index.validate()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IndexSpec {
+    pub mode: IndexMode,
+    pub memory_node_limit: usize,
+    pub disk_dir: Option<PathBuf>,
+}
+
+impl Default for IndexSpec {
+    fn default() -> Self {
+        Self {
+            mode: IndexMode::Auto,
+            memory_node_limit: 5_000_000,
+            disk_dir: None,
+        }
+    }
+}
+
+impl IndexSpec {
+    fn validate(&self) -> Result<()> {
+        if self.memory_node_limit == 0 {
+            return Err(OsmshrinkError::InvalidSpec(
+                "processing.index.memory_node_limit must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lower")]
+pub enum IndexMode {
+    #[default]
+    Auto,
+    Memory,
+    Disk,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -255,6 +296,11 @@ impl OutputSpec {
                 "output.fields must not be empty".to_owned(),
             ));
         }
+        if self.format == OutputFormat::Geojson && !self.fields.contains(&OutputField::Geometry) {
+            return Err(OsmshrinkError::InvalidSpec(
+                "output.fields must include geometry when output.format is geojson".to_owned(),
+            ));
+        }
 
         let mut seen = HashSet::new();
         for field in &self.fields {
@@ -270,18 +316,14 @@ impl OutputSpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lower")]
 pub enum OutputFormat {
+    #[default]
     Ndjson,
     Json,
-}
-
-impl Default for OutputFormat {
-    fn default() -> Self {
-        Self::Ndjson
-    }
+    Geojson,
 }
 
 impl OutputFormat {
@@ -289,25 +331,21 @@ impl OutputFormat {
         match path.extension().and_then(|extension| extension.to_str()) {
             Some("ndjson") => Ok(Self::Ndjson),
             Some("json") => Ok(Self::Json),
+            Some("geojson") => Ok(Self::Geojson),
             _ => Err(OsmshrinkError::UnsupportedOutputFile {
                 path: PathBuf::from(path),
-                expected: ".ndjson or .json",
+                expected: ".ndjson, .json, or .geojson",
             }),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GeometryMode {
+    #[default]
     Full,
     Polygon,
-}
-
-impl Default for GeometryMode {
-    fn default() -> Self {
-        Self::Full
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -372,6 +410,7 @@ mod tests {
         let spec: FilterSpec = serde_json::from_str(JSON_SPEC).unwrap();
         spec.validate().unwrap();
         assert_eq!(spec.output.format, OutputFormat::Ndjson);
+        assert_eq!(spec.processing.index.mode, IndexMode::Auto);
     }
 
     #[test]
@@ -397,6 +436,47 @@ output:
         assert_eq!(
             spec.output.fields,
             vec![OutputField::Id, OutputField::Geometry]
+        );
+    }
+
+    #[test]
+    fn parses_processing_index_options() {
+        let yaml = r#"
+processing:
+  index:
+    mode: disk
+    memory_node_limit: 12
+    disk_dir: /tmp/osmshrink-index
+output:
+  format: ndjson
+"#;
+        let spec: FilterSpec = serde_yaml::from_str(yaml).unwrap();
+        spec.validate().unwrap();
+        assert_eq!(spec.processing.index.mode, IndexMode::Disk);
+        assert_eq!(spec.processing.index.memory_node_limit, 12);
+        assert_eq!(
+            spec.processing.index.disk_dir,
+            Some(PathBuf::from("/tmp/osmshrink-index"))
+        );
+    }
+
+    #[test]
+    fn geojson_requires_geometry_field() {
+        let yaml = r#"
+output:
+  format: geojson
+  fields: [id, tags]
+"#;
+        let spec: FilterSpec = serde_yaml::from_str(yaml).unwrap();
+        let error = spec.validate().unwrap_err().to_string();
+        assert!(error.contains("must include geometry"));
+    }
+
+    #[test]
+    fn detects_geojson_output_extension() {
+        assert_eq!(
+            OutputFormat::from_output_path(Path::new("areas.geojson")).unwrap(),
+            OutputFormat::Geojson
         );
     }
 }

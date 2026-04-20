@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::spec::OutputFormat;
+use crate::spec::{IndexMode, OutputFormat};
 
 #[derive(Debug, Parser)]
 #[command(name = "osmshrink")]
@@ -33,7 +33,7 @@ pub enum Commands {
         output: PathBuf,
     },
 
-    /// Filter a local .osm.pbf file into JSON or NDJSON.
+    /// Filter a local .osm.pbf file into JSON, NDJSON, or GeoJSON.
     Filter {
         /// Input .osm.pbf path.
         #[arg(short, long)]
@@ -43,13 +43,25 @@ pub enum Commands {
         #[arg(short, long)]
         spec: PathBuf,
 
-        /// Output .json or .ndjson path.
+        /// Output .json, .ndjson, or .geojson path.
         #[arg(short, long)]
         output: PathBuf,
 
         /// Override output format from the spec or output extension.
         #[arg(long)]
         format: Option<OutputFormat>,
+
+        /// Override node index mode from the spec.
+        #[arg(long, value_enum)]
+        index: Option<IndexMode>,
+
+        /// Directory for disk-backed node indexes.
+        #[arg(long)]
+        index_dir: Option<PathBuf>,
+
+        /// Node count threshold before auto indexing spills to disk.
+        #[arg(long)]
+        memory_node_limit: Option<usize>,
     },
 
     /// Fetch and filter in one command.
@@ -62,13 +74,25 @@ pub enum Commands {
         #[arg(short, long)]
         spec: PathBuf,
 
-        /// Output .json or .ndjson path.
+        /// Output .json, .ndjson, or .geojson path.
         #[arg(short, long)]
         output: PathBuf,
 
         /// Override output format from the spec or output extension.
         #[arg(long)]
         format: Option<OutputFormat>,
+
+        /// Override node index mode from the spec.
+        #[arg(long, value_enum)]
+        index: Option<IndexMode>,
+
+        /// Directory for disk-backed node indexes.
+        #[arg(long)]
+        index_dir: Option<PathBuf>,
+
+        /// Node count threshold before auto indexing spills to disk.
+        #[arg(long)]
+        memory_node_limit: Option<usize>,
     },
 
     /// Print basic information about an input file.

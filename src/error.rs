@@ -51,9 +51,6 @@ pub enum OsmshrinkError {
     #[error("invalid filter spec: {0}")]
     InvalidSpec(String),
 
-    #[error("relations are not supported in osmshrink v1; use types [\"node\", \"way\"]")]
-    UnsupportedRelations,
-
     #[error("download failed for `{url}`: {source}")]
     Download {
         url: String,
@@ -80,4 +77,7 @@ pub enum OsmshrinkError {
         #[source]
         source: regex::Error,
     },
+
+    #[error("node index failed for `{path}`: {details}")]
+    NodeIndex { path: PathBuf, details: String },
 }

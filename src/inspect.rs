@@ -31,7 +31,7 @@ impl fmt::Display for InspectReport {
         )?;
         writeln!(
             formatter,
-            "detectable: nodes and ways can be filtered; relations are rejected in v1"
+            "detectable: nodes, ways, and area relations can be filtered"
         )
     }
 }

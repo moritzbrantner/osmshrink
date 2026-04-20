@@ -8,6 +8,12 @@ pub struct Coordinate {
     pub lat: f64,
 }
 
+impl From<[f64; 2]> for Coordinate {
+    fn from(value: [f64; 2]) -> Self {
+        Self::new(value[0], value[1])
+    }
+}
+
 impl Coordinate {
     pub fn new(lon: f64, lat: f64) -> Self {
         Self { lon, lat }
@@ -70,9 +76,18 @@ impl BBox {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum Geometry {
-    Point { coordinates: [f64; 2] },
-    LineString { coordinates: Vec<[f64; 2]> },
-    Polygon { coordinates: Vec<Vec<[f64; 2]>> },
+    Point {
+        coordinates: [f64; 2],
+    },
+    LineString {
+        coordinates: Vec<[f64; 2]>,
+    },
+    Polygon {
+        coordinates: Vec<Vec<[f64; 2]>>,
+    },
+    MultiPolygon {
+        coordinates: Vec<Vec<Vec<[f64; 2]>>>,
+    },
 }
 
 pub fn point(coordinate: Coordinate) -> Geometry {
@@ -101,6 +116,70 @@ pub fn way_geometry(
     }
 }
 
+pub fn polygon_or_multipolygon(polygons: Vec<Vec<Vec<Coordinate>>>) -> Option<Geometry> {
+    let mut output: Vec<Vec<Vec<[f64; 2]>>> = polygons
+        .into_iter()
+        .map(|polygon| {
+            polygon
+                .into_iter()
+                .map(|ring| ring.into_iter().map(Coordinate::as_array).collect())
+                .collect()
+        })
+        .collect();
+
+    match output.len() {
+        0 => None,
+        1 => Some(Geometry::Polygon {
+            coordinates: output.remove(0),
+        }),
+        _ => Some(Geometry::MultiPolygon {
+            coordinates: output,
+        }),
+    }
+}
+
+pub fn ring_area(ring: &[Coordinate]) -> f64 {
+    if ring.len() < 4 {
+        return 0.0;
+    }
+    ring.windows(2)
+        .map(|window| {
+            let a = window[0];
+            let b = window[1];
+            (a.lon * b.lat) - (b.lon * a.lat)
+        })
+        .sum::<f64>()
+        / 2.0
+}
+
+pub fn normalize_ring_orientation(ring: &mut [Coordinate], counter_clockwise: bool) {
+    let is_counter_clockwise = ring_area(ring) > 0.0;
+    if is_counter_clockwise != counter_clockwise {
+        ring.reverse();
+    }
+}
+
+pub fn point_in_ring(point: Coordinate, ring: &[Coordinate]) -> bool {
+    if ring.len() < 4 {
+        return false;
+    }
+
+    let mut inside = false;
+    let mut previous = ring[ring.len() - 1];
+    for current in ring.iter().copied() {
+        let intersects = ((current.lat > point.lat) != (previous.lat > point.lat))
+            && (point.lon
+                < (previous.lon - current.lon) * (point.lat - current.lat)
+                    / (previous.lat - current.lat)
+                    + current.lon);
+        if intersects {
+            inside = !inside;
+        }
+        previous = current;
+    }
+    inside
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +189,33 @@ mod tests {
         let bbox = BBox::new([8.5, 48.8, 9.3, 49.2]);
         assert!(bbox.contains(Coordinate::new(8.7, 48.9)));
         assert!(!bbox.contains(Coordinate::new(10.0, 48.9)));
+    }
+
+    #[test]
+    fn normalizes_ring_orientation() {
+        let mut ring = vec![
+            Coordinate::new(0.0, 0.0),
+            Coordinate::new(0.0, 1.0),
+            Coordinate::new(1.0, 1.0),
+            Coordinate::new(1.0, 0.0),
+            Coordinate::new(0.0, 0.0),
+        ];
+        normalize_ring_orientation(&mut ring, true);
+        assert!(ring_area(&ring) > 0.0);
+        normalize_ring_orientation(&mut ring, false);
+        assert!(ring_area(&ring) < 0.0);
+    }
+
+    #[test]
+    fn point_in_ring_detects_inside_and_outside() {
+        let ring = vec![
+            Coordinate::new(0.0, 0.0),
+            Coordinate::new(1.0, 0.0),
+            Coordinate::new(1.0, 1.0),
+            Coordinate::new(0.0, 1.0),
+            Coordinate::new(0.0, 0.0),
+        ];
+        assert!(point_in_ring(Coordinate::new(0.5, 0.5), &ring));
+        assert!(!point_in_ring(Coordinate::new(2.0, 0.5), &ring));
     }
 }

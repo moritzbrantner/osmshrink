@@ -1,8 +1,8 @@
 # osmshrink
 
-`osmshrink` downloads OpenStreetMap regional extracts, filters nodes and ways from
-`.osm.pbf` files, and writes normalized `.ndjson` or `.json` output for downstream
-data pipelines.
+`osmshrink` downloads OpenStreetMap regional extracts, filters nodes, ways, and
+area relations from `.osm.pbf` files, and writes normalized `.ndjson`, `.json`,
+or `.geojson` output for downstream data pipelines.
 
 The first supported download provider is Geofabrik. Sources can be direct URLs or
 short names such as:
@@ -53,6 +53,7 @@ Filter a local extract:
 ```bash
 cargo run -- filter --input data/bw.osm.pbf --spec examples/schools.json --output out/schools.ndjson
 cargo run -- filter --input data/bw.osm.pbf --spec examples/roads.yaml --format json --output out/roads.json
+cargo run -- filter --input data/bw.osm.pbf --spec examples/areas_geojson.yaml --output out/areas.geojson
 ```
 
 Fetch and filter in one command:
@@ -76,7 +77,9 @@ Validate a spec:
 cargo run -- validate-spec --spec examples/schools.json
 ```
 
-Use `--verbose` for more logging and `--quiet` to suppress status output.
+Use `--verbose` for more logging and `--quiet` to suppress status output. Use
+`--index auto|memory|disk`, `--index-dir`, and `--memory-node-limit` to override
+node index behavior from the spec.
 
 ## Filter Specs
 
@@ -90,7 +93,7 @@ Specs can be JSON or YAML. A typical spec looks like:
   },
   "filter": {
     "bbox": [8.5, 48.8, 9.3, 49.2],
-    "types": ["node", "way"],
+    "types": ["node", "way", "relation"],
     "include": {
       "any": [
         { "key": "amenity", "values": ["school", "hospital"] },
@@ -104,6 +107,13 @@ Specs can be JSON or YAML. A typical spec looks like:
       { "key": "access", "values": ["private"] }
     ]
   },
+  "processing": {
+    "index": {
+      "mode": "auto",
+      "memory_node_limit": 5000000,
+      "disk_dir": null
+    }
+  },
   "output": {
     "format": "ndjson",
     "geometry": "full",
@@ -114,7 +124,7 @@ Specs can be JSON or YAML. A typical spec looks like:
 
 Supported filter features:
 
-- `types`: `node` and `way`. If omitted, both are used.
+- `types`: `node`, `way`, and `relation`. If omitted, nodes and ways are used.
 - `bbox`: `[min_lon, min_lat, max_lon, max_lat]`.
 - `include.any`: at least one condition must match.
 - `include.all`: every condition must match.
@@ -135,11 +145,27 @@ BBox behavior:
 
 - nodes match by their own coordinates.
 - ways match when any resolved node coordinate is inside the bbox.
+- relations match when any assembled polygon coordinate is inside the bbox.
+
+Relation behavior:
+
+- only area relations are emitted: `type=multipolygon` and `type=boundary`.
+- relation members with role `outer`, role `inner`, or an empty role are used.
+- other member roles and non-way relation members are ignored and counted.
+- relations are skipped if required member ways or nodes are missing, rings do
+  not close, or inner rings cannot be assigned to an outer ring.
+
+Index behavior:
+
+- `processing.index.mode` can be `auto`, `memory`, or `disk`.
+- `auto` starts with an in-memory node coordinate index and spills to a temporary
+  `redb` database after `memory_node_limit` nodes.
+- `disk_dir` optionally chooses where temporary disk-backed indexes are created.
 
 ## Output
 
 `ndjson` is the default and is preferred for large outputs. `json` writes one
-array.
+array. `geojson` writes a GeoJSON `FeatureCollection`.
 
 Each emitted object has a normalized shape:
 
@@ -163,7 +189,12 @@ Each emitted object has a normalized shape:
 
 Nodes emit `Point` geometry. Ways emit `LineString` by default. If
 `output.geometry` is `polygon`, closed ways with at least four coordinates emit a
-`Polygon`.
+`Polygon`. Area relations emit `Polygon` or `MultiPolygon`.
+
+For GeoJSON output, `output.fields` must include `geometry`. If `id` is included,
+the GeoJSON feature id is formatted as `node/123`, `way/123`, or `relation/123`,
+with `osm_id` added to properties. If `type` is included, `osm_type` is added to
+properties. If `tags` is included, OSM tags are copied to properties.
 
 `output.fields` controls which fields are written, for example:
 
@@ -179,23 +210,23 @@ The crate is split into a reusable library and a CLI:
 - `fetch`: streaming HTTP download to a temporary file, then rename on success.
 - `geofabrik`: shorthand parsing and URL resolution.
 - `spec`: serde models and validation for JSON/YAML specs.
-- `filter`: predicate compilation and PBF filtering pipeline.
-- `geometry`: bbox checks and point/way geometry creation.
+- `filter`: predicate compilation, PBF filtering pipeline, and area relation assembly.
+- `geometry`: bbox checks and point/way/relation geometry creation.
+- `index`: in-memory, disk-backed, and auto-spilling node coordinate indexes.
 - `model`: normalized output model.
-- `output`: JSON and NDJSON writers.
+- `output`: JSON, NDJSON, and GeoJSON writers.
 - `inspect`: cheap filesystem-level input inspection.
 - `error`: typed application errors.
 
 ## Limitations
 
-- Relations are explicitly rejected in v1.
-- Multipolygon assembly is not implemented.
 - Way geometry requires referenced nodes to exist in the extract. A way with
   missing node coordinates is skipped with a warning.
-- The current implementation keeps a node coordinate index in memory so way
-  geometry can be resolved. This is suitable for medium regional extracts, but
-  very large extracts may need a disk-backed index in the future.
-- Output is normalized JSON/NDJSON, not GeoJSON.
+- Relation support is limited to area relations (`multipolygon` and `boundary`).
+  Other relation types are skipped and counted.
+- Relation assembly supports way members only. Nested relations are ignored.
+- Auto indexing can spill node coordinates to disk, but relation member ways are
+  still retained in memory while assembling candidate area relations.
 
 ## Tests
 
@@ -204,13 +235,13 @@ cargo test
 ```
 
 Tests cover Geofabrik shorthand parsing, JSON/YAML spec parsing, condition
-matching, bbox logic, and field filtering. A binary fixture test is intentionally
-not included yet because maintaining a tiny real `.osm.pbf` fixture adds
-repository weight and brittleness.
+matching, bbox logic, field filtering, GeoJSON output, node indexes, and
+constructed-object relation assembly. A binary fixture test is intentionally not
+included yet because maintaining a tiny real `.osm.pbf` fixture adds repository
+weight and brittleness.
 
 ## Roadmap
 
-- Relation and multipolygon support.
-- GeoJSON export mode.
-- Streaming or disk-backed node indexes for larger extracts.
 - Python and Node bindings over the Rust library core.
+- More relation types beyond area relations.
+- Streaming relation member geometry storage for very large relation-heavy extracts.

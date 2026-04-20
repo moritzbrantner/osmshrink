@@ -4,6 +4,7 @@ pub mod fetch;
 pub mod filter;
 pub mod geofabrik;
 pub mod geometry;
+pub mod index;
 pub mod inspect;
 pub mod model;
 pub mod output;

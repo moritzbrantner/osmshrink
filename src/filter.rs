@@ -2,12 +2,16 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::PathBuf;
 
-use osmpbfreader::{NodeId, OsmObj, OsmPbfReader, Tags};
+use osmpbfreader::{NodeId, OsmObj, OsmPbfReader, Relation, RelationId, Tags, Way, WayId};
 use regex::Regex;
 use tracing::warn;
 
 use crate::error::{OsmshrinkError, Result};
-use crate::geometry::{BBox, Coordinate, point, way_geometry};
+use crate::geometry::{
+    BBox, Coordinate, Geometry, normalize_ring_orientation, point, point_in_ring,
+    polygon_or_multipolygon, ring_area, way_geometry,
+};
+use crate::index::{AutoNodeIndex, IndexBackend, IndexOptions, NodeIndex, StoredCoordinate};
 use crate::model::{ElementKind, Feature, Tags as NormalizedTags};
 use crate::output::OutputWriter;
 use crate::spec::{
@@ -20,6 +24,7 @@ pub struct FilterRunOptions {
     pub output: PathBuf,
     pub spec: FilterSpec,
     pub format_override: Option<OutputFormat>,
+    pub index_options: IndexOptions,
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +32,26 @@ pub struct FilterReport {
     pub output: PathBuf,
     pub objects_written: u64,
     pub ways_skipped_missing_nodes: u64,
+    pub relations_skipped_non_area: u64,
+    pub relations_skipped_missing_members: u64,
+    pub relations_skipped_invalid_rings: u64,
+    pub relation_members_ignored_role: u64,
+    pub index_backend: IndexBackend,
+}
+
+impl FilterReport {
+    fn new(output: PathBuf) -> Self {
+        Self {
+            output,
+            objects_written: 0,
+            ways_skipped_missing_nodes: 0,
+            relations_skipped_non_area: 0,
+            relations_skipped_missing_members: 0,
+            relations_skipped_invalid_rings: 0,
+            relation_members_ignored_role: 0,
+            index_backend: IndexBackend::Memory,
+        }
+    }
 }
 
 pub fn filter_pbf(options: FilterRunOptions) -> Result<FilterReport> {
@@ -35,7 +60,11 @@ pub fn filter_pbf(options: FilterRunOptions) -> Result<FilterReport> {
 
     let format = options
         .format_override
-        .unwrap_or_else(|| options.spec.output.format);
+        .unwrap_or(options.spec.output.format);
+    let mut effective_output = options.spec.output.clone();
+    effective_output.format = format;
+    effective_output.validate()?;
+
     let path_format = OutputFormat::from_output_path(&options.output)?;
     if path_format != format {
         return Err(OsmshrinkError::InvalidSpec(format!(
@@ -43,86 +72,317 @@ pub fn filter_pbf(options: FilterRunOptions) -> Result<FilterReport> {
         )));
     }
 
-    let compiled = CompiledFilter::compile(&options.spec)?;
+    let compiled = CompiledFilter::compile(&FilterSpec {
+        output: effective_output.clone(),
+        ..options.spec.clone()
+    })?;
     let mut output = OutputWriter::create(&options.output, format)?;
     output.set_fields(compiled.fields.clone());
-    let mut node_index: HashMap<NodeId, Coordinate> = HashMap::new();
-    let mut objects_written = 0_u64;
+    let mut node_index = AutoNodeIndex::create(options.index_options)?;
+    let mut report = FilterReport::new(options.output.clone());
 
-    let file = File::open(&options.input).map_err(|source| OsmshrinkError::ReadFile {
-        path: options.input.clone(),
+    process_nodes_from_pbf(
+        &options.input,
+        &compiled,
+        &mut node_index,
+        &mut output,
+        &mut report,
+    )?;
+
+    let mut candidates = Vec::new();
+    let mut required_way_ids = HashSet::new();
+    if compiled.includes_type(ElementType::Relation) {
+        collect_relations_from_pbf(
+            &options.input,
+            &compiled,
+            &mut candidates,
+            &mut required_way_ids,
+            &mut report,
+        )?;
+    }
+
+    let mut relation_way_geometries = HashMap::new();
+    if compiled.includes_type(ElementType::Way) || !required_way_ids.is_empty() {
+        process_ways_from_pbf(
+            &options.input,
+            &compiled,
+            &node_index,
+            &required_way_ids,
+            &mut relation_way_geometries,
+            &mut output,
+            &mut report,
+        )?;
+    }
+
+    if compiled.includes_type(ElementType::Relation) {
+        emit_relations(
+            &compiled,
+            &candidates,
+            &relation_way_geometries,
+            &mut output,
+            &mut report,
+        )?;
+    }
+
+    report.index_backend = node_index.backend();
+    output.finish()?;
+    Ok(report)
+}
+
+fn process_nodes_from_pbf(
+    input: &std::path::Path,
+    compiled: &CompiledFilter,
+    node_index: &mut dyn NodeIndex,
+    sink: &mut dyn FeatureSink,
+    report: &mut FilterReport,
+) -> Result<()> {
+    let file = File::open(input).map_err(|source| OsmshrinkError::ReadFile {
+        path: input.to_path_buf(),
         source,
     })?;
     let mut reader = OsmPbfReader::new(file);
     for object in reader.iter() {
         let object = object.map_err(|source| OsmshrinkError::Pbf {
-            path: options.input.clone(),
+            path: input.to_path_buf(),
             source,
         })?;
-
         if let OsmObj::Node(node) = object {
-            let coordinate = Coordinate::new(node.lon(), node.lat());
-            node_index.insert(node.id, coordinate);
-
-            let tags = normalize_tags(&node.tags);
-            if compiled.matches_node(&tags, coordinate) {
-                output.write_feature(&Feature {
-                    id: node.id.0,
-                    kind: ElementKind::Node,
-                    tags,
-                    geometry: point(coordinate),
-                })?;
-                objects_written += 1;
-            }
+            process_node(
+                node.id,
+                StoredCoordinate::new(node.decimicro_lon, node.decimicro_lat),
+                &node.tags,
+                compiled,
+                node_index,
+                sink,
+                report,
+            )?;
         }
     }
+    Ok(())
+}
 
-    let mut ways_skipped_missing_nodes = 0_u64;
-    if compiled.includes_type(ElementType::Way) {
-        let file = File::open(&options.input).map_err(|source| OsmshrinkError::ReadFile {
-            path: options.input.clone(),
+fn collect_relations_from_pbf(
+    input: &std::path::Path,
+    compiled: &CompiledFilter,
+    candidates: &mut Vec<CandidateRelation>,
+    required_way_ids: &mut HashSet<WayId>,
+    report: &mut FilterReport,
+) -> Result<()> {
+    let file = File::open(input).map_err(|source| OsmshrinkError::ReadFile {
+        path: input.to_path_buf(),
+        source,
+    })?;
+    let mut reader = OsmPbfReader::new(file);
+    for object in reader.iter() {
+        let object = object.map_err(|source| OsmshrinkError::Pbf {
+            path: input.to_path_buf(),
             source,
         })?;
-        let mut reader = OsmPbfReader::new(file);
-
-        for object in reader.iter() {
-            let object = object.map_err(|source| OsmshrinkError::Pbf {
-                path: options.input.clone(),
-                source,
-            })?;
-
-            if let OsmObj::Way(way) = object {
-                let Some(coordinates) = coordinates_for_way(&way.nodes, &node_index) else {
-                    ways_skipped_missing_nodes += 1;
-                    warn!(
-                        way_id = way.id.0,
-                        "skipping way because one or more referenced nodes are missing"
-                    );
-                    continue;
-                };
-
-                let tags = normalize_tags(&way.tags);
-                if compiled.matches_way(&tags, &coordinates) {
-                    let is_closed = way.nodes.first() == way.nodes.last();
-                    output.write_feature(&Feature {
-                        id: way.id.0,
-                        kind: ElementKind::Way,
-                        tags,
-                        geometry: way_geometry(&coordinates, is_closed, compiled.geometry_mode),
-                    })?;
-                    objects_written += 1;
-                }
-            }
+        if let OsmObj::Relation(relation) = object {
+            collect_relation(relation, compiled, candidates, required_way_ids, report);
         }
     }
+    Ok(())
+}
 
-    output.finish()?;
+fn process_ways_from_pbf(
+    input: &std::path::Path,
+    compiled: &CompiledFilter,
+    node_index: &dyn NodeIndex,
+    required_way_ids: &HashSet<WayId>,
+    relation_way_geometries: &mut HashMap<WayId, Vec<Coordinate>>,
+    sink: &mut dyn FeatureSink,
+    report: &mut FilterReport,
+) -> Result<()> {
+    let file = File::open(input).map_err(|source| OsmshrinkError::ReadFile {
+        path: input.to_path_buf(),
+        source,
+    })?;
+    let mut reader = OsmPbfReader::new(file);
+    for object in reader.iter() {
+        let object = object.map_err(|source| OsmshrinkError::Pbf {
+            path: input.to_path_buf(),
+            source,
+        })?;
+        if let OsmObj::Way(way) = object {
+            process_way(
+                &way,
+                compiled,
+                node_index,
+                required_way_ids,
+                relation_way_geometries,
+                sink,
+                report,
+            )?;
+        }
+    }
+    Ok(())
+}
 
-    Ok(FilterReport {
-        output: options.output,
-        objects_written,
-        ways_skipped_missing_nodes,
-    })
+fn process_node(
+    node_id: NodeId,
+    coordinate: StoredCoordinate,
+    tags: &Tags,
+    compiled: &CompiledFilter,
+    node_index: &mut dyn NodeIndex,
+    sink: &mut dyn FeatureSink,
+    report: &mut FilterReport,
+) -> Result<()> {
+    node_index.insert(node_id, coordinate)?;
+
+    let coordinate = coordinate.to_coordinate();
+    let tags = normalize_tags(tags);
+    if compiled.matches_node(&tags, coordinate) {
+        sink.write_feature(Feature {
+            id: node_id.0,
+            kind: ElementKind::Node,
+            tags,
+            geometry: point(coordinate),
+        })?;
+        report.objects_written += 1;
+    }
+    Ok(())
+}
+
+fn collect_relation(
+    relation: Relation,
+    compiled: &CompiledFilter,
+    candidates: &mut Vec<CandidateRelation>,
+    required_way_ids: &mut HashSet<WayId>,
+    report: &mut FilterReport,
+) {
+    let tags = normalize_tags(&relation.tags);
+    if !compiled.matches_relation_tags(&tags) {
+        return;
+    }
+
+    if !is_area_relation(&tags) {
+        report.relations_skipped_non_area += 1;
+        return;
+    }
+
+    let mut members = Vec::new();
+    for member in relation.refs {
+        let role = member.role.as_str();
+        let Some(way_id) = member.member.way() else {
+            report.relation_members_ignored_role += 1;
+            continue;
+        };
+        let member_role = match role {
+            "" | "outer" => RelationMemberRole::Outer,
+            "inner" => RelationMemberRole::Inner,
+            _ => {
+                report.relation_members_ignored_role += 1;
+                continue;
+            }
+        };
+        required_way_ids.insert(way_id);
+        members.push(RelationWayMember {
+            way_id,
+            role: member_role,
+        });
+    }
+
+    candidates.push(CandidateRelation {
+        id: relation.id,
+        tags,
+        members,
+    });
+}
+
+fn process_way(
+    way: &Way,
+    compiled: &CompiledFilter,
+    node_index: &dyn NodeIndex,
+    required_way_ids: &HashSet<WayId>,
+    relation_way_geometries: &mut HashMap<WayId, Vec<Coordinate>>,
+    sink: &mut dyn FeatureSink,
+    report: &mut FilterReport,
+) -> Result<()> {
+    let coordinates = match coordinates_for_way(&way.nodes, node_index)? {
+        Some(coordinates) => coordinates,
+        None => {
+            if compiled.includes_type(ElementType::Way) {
+                report.ways_skipped_missing_nodes += 1;
+                warn!(
+                    way_id = way.id.0,
+                    "skipping way because one or more referenced nodes are missing"
+                );
+            }
+            return Ok(());
+        }
+    };
+
+    if required_way_ids.contains(&way.id) {
+        relation_way_geometries.insert(way.id, coordinates.clone());
+    }
+
+    let tags = normalize_tags(&way.tags);
+    if compiled.matches_way(&tags, &coordinates) {
+        sink.write_feature(Feature {
+            id: way.id.0,
+            kind: ElementKind::Way,
+            tags,
+            geometry: way_geometry(&coordinates, way.is_closed(), compiled.geometry_mode),
+        })?;
+        report.objects_written += 1;
+    }
+    Ok(())
+}
+
+fn emit_relations(
+    compiled: &CompiledFilter,
+    candidates: &[CandidateRelation],
+    relation_way_geometries: &HashMap<WayId, Vec<Coordinate>>,
+    sink: &mut dyn FeatureSink,
+    report: &mut FilterReport,
+) -> Result<()> {
+    for candidate in candidates {
+        let geometry = match assemble_relation(candidate, relation_way_geometries) {
+            RelationAssemblyResult::Geometry(geometry) => geometry,
+            RelationAssemblyResult::MissingMembers => {
+                report.relations_skipped_missing_members += 1;
+                continue;
+            }
+            RelationAssemblyResult::InvalidRings => {
+                report.relations_skipped_invalid_rings += 1;
+                continue;
+            }
+        };
+
+        if !compiled.matches_relation_geometry(&geometry) {
+            continue;
+        }
+
+        sink.write_feature(Feature {
+            id: candidate.id.0,
+            kind: ElementKind::Relation,
+            tags: candidate.tags.clone(),
+            geometry,
+        })?;
+        report.objects_written += 1;
+    }
+    Ok(())
+}
+
+fn coordinates_for_way(
+    nodes: &[NodeId],
+    node_index: &dyn NodeIndex,
+) -> Result<Option<Vec<Coordinate>>> {
+    let mut coordinates = Vec::with_capacity(nodes.len());
+    for node_id in nodes {
+        let Some(coordinate) = node_index.get(*node_id)? else {
+            return Ok(None);
+        };
+        coordinates.push(coordinate.to_coordinate());
+    }
+    Ok(Some(coordinates))
+}
+
+fn normalize_tags(tags: &Tags) -> NormalizedTags {
+    tags.iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
 }
 
 fn validate_input_path(path: &std::path::Path) -> Result<()> {
@@ -139,20 +399,215 @@ fn validate_input_path(path: &std::path::Path) -> Result<()> {
     }
 }
 
-fn coordinates_for_way(
-    nodes: &[NodeId],
-    node_index: &HashMap<NodeId, Coordinate>,
-) -> Option<Vec<Coordinate>> {
-    nodes
-        .iter()
-        .map(|node_id| node_index.get(node_id).copied())
-        .collect()
+trait FeatureSink {
+    fn write_feature(&mut self, feature: Feature) -> Result<()>;
 }
 
-fn normalize_tags(tags: &Tags) -> NormalizedTags {
-    tags.iter()
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect()
+impl FeatureSink for OutputWriter {
+    fn write_feature(&mut self, feature: Feature) -> Result<()> {
+        OutputWriter::write_feature(self, &feature)
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct VecFeatureSink {
+    features: Vec<Feature>,
+}
+
+#[cfg(test)]
+impl VecFeatureSink {
+    fn new() -> Self {
+        Self {
+            features: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl FeatureSink for VecFeatureSink {
+    fn write_feature(&mut self, feature: Feature) -> Result<()> {
+        self.features.push(feature);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CandidateRelation {
+    id: RelationId,
+    tags: NormalizedTags,
+    members: Vec<RelationWayMember>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RelationWayMember {
+    way_id: WayId,
+    role: RelationMemberRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelationMemberRole {
+    Outer,
+    Inner,
+}
+
+#[derive(Debug)]
+enum RelationAssemblyResult {
+    Geometry(Geometry),
+    MissingMembers,
+    InvalidRings,
+}
+
+fn is_area_relation(tags: &NormalizedTags) -> bool {
+    matches!(
+        tags.get("type").map(String::as_str),
+        Some("multipolygon" | "boundary")
+    )
+}
+
+fn assemble_relation(
+    candidate: &CandidateRelation,
+    relation_way_geometries: &HashMap<WayId, Vec<Coordinate>>,
+) -> RelationAssemblyResult {
+    let mut outer_segments = Vec::new();
+    let mut inner_segments = Vec::new();
+    for member in &candidate.members {
+        let Some(coordinates) = relation_way_geometries.get(&member.way_id) else {
+            return RelationAssemblyResult::MissingMembers;
+        };
+        match member.role {
+            RelationMemberRole::Outer => outer_segments.push(coordinates.clone()),
+            RelationMemberRole::Inner => inner_segments.push(coordinates.clone()),
+        }
+    }
+
+    let Some(mut outer_rings) = stitch_rings(outer_segments) else {
+        return RelationAssemblyResult::InvalidRings;
+    };
+    let Some(mut inner_rings) = stitch_rings(inner_segments) else {
+        return RelationAssemblyResult::InvalidRings;
+    };
+
+    if outer_rings.is_empty() {
+        return RelationAssemblyResult::InvalidRings;
+    }
+
+    for ring in &mut outer_rings {
+        normalize_ring_orientation(ring, true);
+    }
+    for ring in &mut inner_rings {
+        normalize_ring_orientation(ring, false);
+    }
+
+    let mut polygons: Vec<Vec<Vec<Coordinate>>> =
+        outer_rings.into_iter().map(|outer| vec![outer]).collect();
+
+    for inner in inner_rings {
+        let Some(point) = inner.first().copied() else {
+            return RelationAssemblyResult::InvalidRings;
+        };
+        let Some((target_index, _)) = polygons
+            .iter()
+            .enumerate()
+            .filter_map(|(index, polygon)| {
+                let outer = &polygon[0];
+                if point_in_ring(point, outer) {
+                    Some((index, ring_area(outer).abs()))
+                } else {
+                    None
+                }
+            })
+            .min_by(|(_, left), (_, right)| left.total_cmp(right))
+        else {
+            return RelationAssemblyResult::InvalidRings;
+        };
+        polygons[target_index].push(inner);
+    }
+
+    match polygon_or_multipolygon(polygons) {
+        Some(geometry) => RelationAssemblyResult::Geometry(geometry),
+        None => RelationAssemblyResult::InvalidRings,
+    }
+}
+
+fn stitch_rings(mut segments: Vec<Vec<Coordinate>>) -> Option<Vec<Vec<Coordinate>>> {
+    let mut rings = Vec::new();
+
+    while !segments.is_empty() {
+        let mut ring = segments.remove(0);
+        if ring.len() < 2 {
+            return None;
+        }
+
+        loop {
+            if is_valid_closed_ring(&ring) {
+                rings.push(ring);
+                break;
+            }
+
+            let (index, action) = find_connecting_segment(&ring, &segments)?;
+            let segment = segments.remove(index);
+            apply_segment(&mut ring, segment, action);
+        }
+    }
+
+    Some(rings)
+}
+
+fn is_valid_closed_ring(ring: &[Coordinate]) -> bool {
+    ring.len() >= 4 && ring.first() == ring.last()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StitchAction {
+    AppendForward,
+    AppendReverse,
+    PrependForward,
+    PrependReverse,
+}
+
+fn find_connecting_segment(
+    ring: &[Coordinate],
+    segments: &[Vec<Coordinate>],
+) -> Option<(usize, StitchAction)> {
+    let first = *ring.first()?;
+    let last = *ring.last()?;
+    segments.iter().enumerate().find_map(|(index, segment)| {
+        let segment_first = *segment.first()?;
+        let segment_last = *segment.last()?;
+        if last == segment_first {
+            Some((index, StitchAction::AppendForward))
+        } else if last == segment_last {
+            Some((index, StitchAction::AppendReverse))
+        } else if first == segment_last {
+            Some((index, StitchAction::PrependForward))
+        } else if first == segment_first {
+            Some((index, StitchAction::PrependReverse))
+        } else {
+            None
+        }
+    })
+}
+
+fn apply_segment(ring: &mut Vec<Coordinate>, mut segment: Vec<Coordinate>, action: StitchAction) {
+    match action {
+        StitchAction::AppendForward => ring.extend(segment.into_iter().skip(1)),
+        StitchAction::AppendReverse => {
+            segment.reverse();
+            ring.extend(segment.into_iter().skip(1));
+        }
+        StitchAction::PrependForward => {
+            segment.pop();
+            segment.extend(ring.iter().copied());
+            *ring = segment;
+        }
+        StitchAction::PrependReverse => {
+            segment.reverse();
+            segment.pop();
+            segment.extend(ring.iter().copied());
+            *ring = segment;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -176,10 +631,6 @@ impl CompiledFilter {
             .unwrap_or_else(|| vec![ElementType::Node, ElementType::Way])
             .into_iter()
             .collect();
-
-        if types.contains(&ElementType::Relation) {
-            return Err(OsmshrinkError::UnsupportedRelations);
-        }
 
         let IncludeRules { any, all } = spec.filter.include.clone().unwrap_or_default();
 
@@ -216,6 +667,20 @@ impl CompiledFilter {
                 .unwrap_or(true)
     }
 
+    fn matches_relation_tags(&self, tags: &NormalizedTags) -> bool {
+        self.types.contains(&ElementType::Relation) && self.matches_tags(tags)
+    }
+
+    fn matches_relation_geometry(&self, geometry: &Geometry) -> bool {
+        self.types.contains(&ElementType::Relation)
+            && self
+                .bbox
+                .map(|bbox| {
+                    geometry_coordinates(geometry).any(|coordinate| bbox.contains(coordinate))
+                })
+                .unwrap_or(true)
+    }
+
     fn matches_tags(&self, tags: &NormalizedTags) -> bool {
         if self.exclude.iter().any(|condition| condition.matches(tags)) {
             return false;
@@ -233,6 +698,27 @@ impl CompiledFilter {
         self.include_all
             .iter()
             .all(|condition| condition.matches(tags))
+    }
+}
+
+fn geometry_coordinates(geometry: &Geometry) -> Box<dyn Iterator<Item = Coordinate> + '_> {
+    match geometry {
+        Geometry::Point { coordinates } => Box::new(std::iter::once((*coordinates).into())),
+        Geometry::LineString { coordinates } => {
+            Box::new(coordinates.iter().copied().map(Coordinate::from))
+        }
+        Geometry::Polygon { coordinates } => Box::new(
+            coordinates
+                .iter()
+                .flat_map(|ring| ring.iter().copied().map(Coordinate::from)),
+        ),
+        Geometry::MultiPolygon { coordinates } => {
+            Box::new(coordinates.iter().flat_map(|polygon| {
+                polygon
+                    .iter()
+                    .flat_map(|ring| ring.iter().copied().map(Coordinate::from))
+            }))
+        }
     }
 }
 
@@ -304,7 +790,10 @@ enum ConditionOperator {
 
 #[cfg(test)]
 mod tests {
-    use crate::spec::{FilterRules, OutputSpec};
+    use osmpbfreader::{Node, OsmId, Ref, RelationId};
+
+    use crate::index::MemoryNodeIndex;
+    use crate::spec::{FilterRules, OutputSpec, ProcessingSpec};
 
     use super::*;
 
@@ -313,6 +802,126 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect()
+    }
+
+    fn osm_tags(values: &[(&str, &str)]) -> Tags {
+        values
+            .iter()
+            .map(|(key, value)| ((*key).into(), (*value).into()))
+            .collect()
+    }
+
+    fn node(id: i64, lon: f64, lat: f64, tags: Tags) -> OsmObj {
+        let stored = StoredCoordinate::from_degrees(lon, lat);
+        OsmObj::Node(Node {
+            id: NodeId(id),
+            tags,
+            decimicro_lat: stored.decimicro_lat,
+            decimicro_lon: stored.decimicro_lon,
+        })
+    }
+
+    fn way(id: i64, nodes: &[i64], tags: Tags) -> OsmObj {
+        OsmObj::Way(Way {
+            id: WayId(id),
+            tags,
+            nodes: nodes.iter().copied().map(NodeId).collect(),
+        })
+    }
+
+    fn relation(id: i64, refs: Vec<(OsmId, &str)>, tags: Tags) -> OsmObj {
+        OsmObj::Relation(Relation {
+            id: RelationId(id),
+            tags,
+            refs: refs
+                .into_iter()
+                .map(|(member, role)| Ref {
+                    member,
+                    role: role.into(),
+                })
+                .collect(),
+        })
+    }
+
+    fn spec(types: Vec<ElementType>, include: Option<IncludeRules>) -> FilterSpec {
+        FilterSpec {
+            source: None,
+            filter: FilterRules {
+                bbox: None,
+                types: Some(types),
+                include,
+                exclude: Vec::new(),
+            },
+            processing: ProcessingSpec::default(),
+            output: OutputSpec::default(),
+        }
+    }
+
+    fn filter_constructed_objects(
+        objects: &[OsmObj],
+        spec: FilterSpec,
+    ) -> Result<(Vec<Feature>, FilterReport)> {
+        let compiled = CompiledFilter::compile(&spec)?;
+        let mut node_index = MemoryNodeIndex::new();
+        let mut sink = VecFeatureSink::new();
+        let mut report = FilterReport::new(PathBuf::from("test.ndjson"));
+
+        for object in objects {
+            if let OsmObj::Node(node) = object {
+                process_node(
+                    node.id,
+                    StoredCoordinate::new(node.decimicro_lon, node.decimicro_lat),
+                    &node.tags,
+                    &compiled,
+                    &mut node_index,
+                    &mut sink,
+                    &mut report,
+                )?;
+            }
+        }
+
+        let mut candidates = Vec::new();
+        let mut required_way_ids = HashSet::new();
+        if compiled.includes_type(ElementType::Relation) {
+            for object in objects {
+                if let OsmObj::Relation(relation) = object {
+                    collect_relation(
+                        relation.clone(),
+                        &compiled,
+                        &mut candidates,
+                        &mut required_way_ids,
+                        &mut report,
+                    );
+                }
+            }
+        }
+
+        let mut relation_way_geometries = HashMap::new();
+        if compiled.includes_type(ElementType::Way) || !required_way_ids.is_empty() {
+            for object in objects {
+                if let OsmObj::Way(way) = object {
+                    process_way(
+                        way,
+                        &compiled,
+                        &node_index,
+                        &required_way_ids,
+                        &mut relation_way_geometries,
+                        &mut sink,
+                        &mut report,
+                    )?;
+                }
+            }
+        }
+
+        emit_relations(
+            &compiled,
+            &candidates,
+            &relation_way_geometries,
+            &mut sink,
+            &mut report,
+        )?;
+
+        Ok((sink.features, report))
     }
 
     #[test]
@@ -381,6 +990,7 @@ mod tests {
                     negate: false,
                 }],
             },
+            processing: ProcessingSpec::default(),
             output: OutputSpec::default(),
         };
         let filter = CompiledFilter::compile(&spec).unwrap();
@@ -410,6 +1020,7 @@ mod tests {
                 include: None,
                 exclude: Vec::new(),
             },
+            processing: ProcessingSpec::default(),
             output: OutputSpec::default(),
         };
         let filter = CompiledFilter::compile(&spec).unwrap();
@@ -419,5 +1030,181 @@ mod tests {
             &[Coordinate::new(8.7, 48.9), Coordinate::new(10.0, 49.0)]
         ));
         assert!(!filter.matches_way(&tags(&[]), &[Coordinate::new(10.0, 49.0)]));
+    }
+
+    #[test]
+    fn relation_multipolygon_is_emitted_from_constructed_objects() {
+        let objects = vec![
+            node(1, 0.0, 0.0, osm_tags(&[])),
+            node(2, 1.0, 0.0, osm_tags(&[])),
+            node(3, 1.0, 1.0, osm_tags(&[])),
+            node(4, 0.0, 1.0, osm_tags(&[])),
+            way(10, &[1, 2, 3], osm_tags(&[])),
+            way(11, &[3, 4, 1], osm_tags(&[])),
+            relation(
+                20,
+                vec![
+                    (OsmId::Way(WayId(10)), "outer"),
+                    (OsmId::Way(WayId(11)), ""),
+                ],
+                osm_tags(&[("type", "multipolygon"), ("name", "Area")]),
+            ),
+        ];
+
+        let (features, report) =
+            filter_constructed_objects(&objects, spec(vec![ElementType::Relation], None)).unwrap();
+
+        assert_eq!(report.objects_written, 1);
+        assert_eq!(features[0].kind, ElementKind::Relation);
+        assert!(matches!(features[0].geometry, Geometry::Polygon { .. }));
+    }
+
+    #[test]
+    fn relation_stitches_reversed_way_fragments() {
+        let objects = vec![
+            node(1, 0.0, 0.0, osm_tags(&[])),
+            node(2, 1.0, 0.0, osm_tags(&[])),
+            node(3, 1.0, 1.0, osm_tags(&[])),
+            node(4, 0.0, 1.0, osm_tags(&[])),
+            way(10, &[1, 2, 3], osm_tags(&[])),
+            way(11, &[1, 4, 3], osm_tags(&[])),
+            relation(
+                20,
+                vec![
+                    (OsmId::Way(WayId(10)), "outer"),
+                    (OsmId::Way(WayId(11)), "outer"),
+                ],
+                osm_tags(&[("type", "multipolygon")]),
+            ),
+        ];
+
+        let (features, report) =
+            filter_constructed_objects(&objects, spec(vec![ElementType::Relation], None)).unwrap();
+
+        assert_eq!(report.objects_written, 1);
+        assert!(matches!(features[0].geometry, Geometry::Polygon { .. }));
+    }
+
+    #[test]
+    fn relation_with_multiple_outers_emits_multipolygon() {
+        let objects = vec![
+            node(1, 0.0, 0.0, osm_tags(&[])),
+            node(2, 1.0, 0.0, osm_tags(&[])),
+            node(3, 1.0, 1.0, osm_tags(&[])),
+            node(4, 0.0, 1.0, osm_tags(&[])),
+            node(5, 3.0, 3.0, osm_tags(&[])),
+            node(6, 4.0, 3.0, osm_tags(&[])),
+            node(7, 4.0, 4.0, osm_tags(&[])),
+            node(8, 3.0, 4.0, osm_tags(&[])),
+            way(10, &[1, 2, 3, 4, 1], osm_tags(&[])),
+            way(11, &[5, 6, 7, 8, 5], osm_tags(&[])),
+            relation(
+                20,
+                vec![
+                    (OsmId::Way(WayId(10)), "outer"),
+                    (OsmId::Way(WayId(11)), "outer"),
+                ],
+                osm_tags(&[("type", "multipolygon")]),
+            ),
+        ];
+
+        let (features, _) =
+            filter_constructed_objects(&objects, spec(vec![ElementType::Relation], None)).unwrap();
+
+        assert!(matches!(
+            features[0].geometry,
+            Geometry::MultiPolygon { .. }
+        ));
+    }
+
+    #[test]
+    fn relation_with_open_ring_is_skipped() {
+        let objects = vec![
+            node(1, 0.0, 0.0, osm_tags(&[])),
+            node(2, 1.0, 0.0, osm_tags(&[])),
+            node(3, 1.0, 1.0, osm_tags(&[])),
+            way(10, &[1, 2, 3], osm_tags(&[])),
+            relation(
+                20,
+                vec![(OsmId::Way(WayId(10)), "outer")],
+                osm_tags(&[("type", "multipolygon")]),
+            ),
+        ];
+
+        let (features, report) =
+            filter_constructed_objects(&objects, spec(vec![ElementType::Relation], None)).unwrap();
+
+        assert!(features.is_empty());
+        assert_eq!(report.relations_skipped_invalid_rings, 1);
+    }
+
+    #[test]
+    fn relation_with_hole_assigns_inner_ring() {
+        let objects = vec![
+            node(1, 0.0, 0.0, osm_tags(&[])),
+            node(2, 4.0, 0.0, osm_tags(&[])),
+            node(3, 4.0, 4.0, osm_tags(&[])),
+            node(4, 0.0, 4.0, osm_tags(&[])),
+            node(5, 1.0, 1.0, osm_tags(&[])),
+            node(6, 2.0, 1.0, osm_tags(&[])),
+            node(7, 2.0, 2.0, osm_tags(&[])),
+            node(8, 1.0, 2.0, osm_tags(&[])),
+            way(10, &[1, 2, 3, 4, 1], osm_tags(&[])),
+            way(11, &[5, 6, 7, 8, 5], osm_tags(&[])),
+            relation(
+                20,
+                vec![
+                    (OsmId::Way(WayId(10)), "outer"),
+                    (OsmId::Way(WayId(11)), "inner"),
+                ],
+                osm_tags(&[("type", "multipolygon")]),
+            ),
+        ];
+
+        let (features, _) =
+            filter_constructed_objects(&objects, spec(vec![ElementType::Relation], None)).unwrap();
+
+        let Geometry::Polygon { coordinates } = &features[0].geometry else {
+            panic!("expected polygon");
+        };
+        assert_eq!(coordinates.len(), 2);
+    }
+
+    #[test]
+    fn non_area_relation_is_counted_and_skipped() {
+        let objects = vec![relation(
+            20,
+            vec![],
+            osm_tags(&[("type", "route"), ("route", "bus")]),
+        )];
+
+        let (features, report) =
+            filter_constructed_objects(&objects, spec(vec![ElementType::Relation], None)).unwrap();
+
+        assert!(features.is_empty());
+        assert_eq!(report.relations_skipped_non_area, 1);
+    }
+
+    #[test]
+    fn node_way_regression_still_ignores_relations_when_not_requested() {
+        let objects = vec![
+            node(1, 0.0, 0.0, osm_tags(&[("amenity", "school")])),
+            node(2, 1.0, 0.0, osm_tags(&[])),
+            way(10, &[1, 2], osm_tags(&[("highway", "primary")])),
+            relation(20, vec![], osm_tags(&[("type", "multipolygon")])),
+        ];
+
+        let (features, report) = filter_constructed_objects(
+            &objects,
+            spec(vec![ElementType::Node, ElementType::Way], None),
+        )
+        .unwrap();
+
+        assert_eq!(report.objects_written, 3);
+        assert!(
+            features
+                .iter()
+                .all(|feature| feature.kind != ElementKind::Relation)
+        );
     }
 }
