@@ -1,0 +1,32 @@
+{
+  "source": {
+    "provider": "geofabrik",
+    "region": "europe/germany/saarland"
+  },
+  "filter": {
+    "bbox": [6.93, 49.21, 7.07, 49.27],
+    "types": ["node", "way", "relation"],
+    "include": {
+      "any": [
+        { "key": "amenity", "values": ["school", "hospital"] },
+        { "key": "shop", "value": "bakery" },
+        { "key": "highway", "values": ["primary", "secondary", "tertiary"] },
+        { "key": "railway", "values": ["rail", "light_rail", "tram"] },
+        { "key": "leisure", "value": "park" },
+        { "key": "natural", "value": "water" },
+        { "key": "building", "values": ["university", "school", "hospital"] }
+      ]
+    }
+  },
+  "processing": {
+    "index": {
+      "mode": "auto",
+      "memory_node_limit": 5000000
+    }
+  },
+  "output": {
+    "format": "json",
+    "geometry": "polygon",
+    "fields": ["id", "type", "tags", "geometry"]
+  }
+}

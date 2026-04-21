@@ -225,6 +225,26 @@ properties. If `tags` is included, OSM tags are copied to properties.
 ["id", "geometry"]
 ```
 
+## Interactive Demo
+
+The React and Leaflet demo in `demo/` loads `.json`, `.ndjson`, and `.geojson`
+output files from disk, applies type and tag filters, and groups matching
+features into toggleable map layers. Its default sample is generated from the
+Saarland Geofabrik PBF with `examples/saarland_demo.json`.
+
+```bash
+cd demo
+npm install
+npm run dev
+```
+
+Regenerate the sample data:
+
+```bash
+cargo run -- fetch geofabrik:europe/germany/saarland --output data/saarland.osm.pbf
+cargo run -- filter --input data/saarland.osm.pbf --spec examples/saarland_demo.json --format json --output demo/public/saarland-sample.json
+```
+
 ## Architecture
 
 The crate is split into a reusable library and a CLI:
