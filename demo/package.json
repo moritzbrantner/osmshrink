@@ -4,9 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite --host 127.0.0.1",
-    "build": "vite build",
-    "preview": "vite preview --host 127.0.0.1"
+    "dev": "npm run dev:wasm",
+    "build:wasm": "wasm-pack build ../wasm --target web --out-dir ../demo/src/wasm/pkg --release",
+    "dev:wasm": "npm run build:wasm && vite --host 127.0.0.1",
+    "build": "npm run build:wasm && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "e2e:server": "npm run build:wasm && vite --host 127.0.0.1 --port 4173",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "leaflet": "^1.9.4",
@@ -14,6 +18,7 @@
     "react-dom": "^19.1.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.59.1",
     "vite": "^7.1.12"
   }
 }

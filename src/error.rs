@@ -51,6 +51,7 @@ pub enum OsmshrinkError {
     #[error("invalid filter spec: {0}")]
     InvalidSpec(String),
 
+    #[cfg(feature = "cli")]
     #[error("download failed for `{url}`: {source}")]
     Download {
         url: String,
@@ -58,6 +59,7 @@ pub enum OsmshrinkError {
         source: reqwest::Error,
     },
 
+    #[cfg(feature = "cli")]
     #[error("HTTP request for `{url}` failed with status {status}")]
     HttpStatus {
         url: String,
@@ -80,4 +82,7 @@ pub enum OsmshrinkError {
 
     #[error("node index failed for `{path}`: {details}")]
     NodeIndex { path: PathBuf, details: String },
+
+    #[error("unsupported runtime option: {0}")]
+    UnsupportedRuntime(String),
 }

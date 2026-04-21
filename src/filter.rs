@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "cli")]
 use std::fs::File;
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
 
 use osmpbfreader::{NodeId, OsmObj, OsmPbfReader, Relation, RelationId, Tags, Way, WayId};
@@ -13,14 +15,16 @@ use crate::geometry::{
 };
 use crate::index::{AutoNodeIndex, IndexBackend, IndexOptions, NodeIndex, StoredCoordinate};
 use crate::model::{ElementKind, Feature, Tags as NormalizedTags};
+#[cfg(feature = "cli")]
 use crate::output::OutputWriter;
-use crate::spec::{
-    ElementType, FilterSpec, GeometryMode, IncludeRules, OutputField, OutputFormat, TagCondition,
-};
+#[cfg(feature = "cli")]
+use crate::spec::OutputFormat;
+use crate::spec::{ElementType, FilterSpec, GeometryMode, IncludeRules, OutputField, TagCondition};
 
 const NODE_INDEX_BATCH_SIZE: usize = 16_384;
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "cli")]
 pub struct FilterRunOptions {
     pub input: PathBuf,
     pub output: PathBuf,
@@ -30,8 +34,16 @@ pub struct FilterRunOptions {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "cli")]
 pub struct CollectRunOptions {
     pub input: PathBuf,
+    pub spec: FilterSpec,
+    pub index_options: IndexOptions,
+}
+
+#[derive(Debug, Clone)]
+pub struct CollectBytesOptions<'a> {
+    pub input: &'a [u8],
     pub spec: FilterSpec,
     pub index_options: IndexOptions,
 }
@@ -94,6 +106,7 @@ impl FilterReport {
     }
 }
 
+#[cfg(feature = "cli")]
 pub fn filter_pbf(options: FilterRunOptions) -> Result<FilterReport> {
     validate_input_path(&options.input)?;
     let format = options
@@ -119,8 +132,8 @@ pub fn filter_pbf(options: FilterRunOptions) -> Result<FilterReport> {
     output.set_fields(compiled.fields.clone());
     let mut report = FilterReport::new(options.output.clone());
 
-    run_filter_pipeline(
-        &options.input,
+    run_filter_pipeline_from_path(
+        options.input.clone(),
         &compiled,
         options.index_options,
         &mut output,
@@ -130,14 +143,15 @@ pub fn filter_pbf(options: FilterRunOptions) -> Result<FilterReport> {
     Ok(report)
 }
 
+#[cfg(feature = "cli")]
 pub fn collect_pbf(options: CollectRunOptions) -> Result<CollectedFeatures> {
     validate_input_path(&options.input)?;
     let compiled = CompiledFilter::compile(&options.spec)?;
     let mut sink = VecFeatureSink::new();
     let mut report = FilterReport::new(PathBuf::from("<memory>"));
 
-    run_filter_pipeline(
-        &options.input,
+    run_filter_pipeline_from_path(
+        options.input.clone(),
         &compiled,
         options.index_options,
         &mut sink,
@@ -150,13 +164,61 @@ pub fn collect_pbf(options: CollectRunOptions) -> Result<CollectedFeatures> {
     })
 }
 
-fn run_filter_pipeline(
-    input: &std::path::Path,
+pub fn collect_pbf_bytes(options: CollectBytesOptions<'_>) -> Result<CollectedFeatures> {
+    let compiled = CompiledFilter::compile(&options.spec)?;
+    let mut sink = VecFeatureSink::new();
+    let mut report = FilterReport::new(PathBuf::from("<memory>"));
+
+    run_filter_pipeline(
+        PathBuf::from("<memory>"),
+        || Ok(Cursor::new(options.input)),
+        &compiled,
+        options.index_options,
+        &mut sink,
+        &mut report,
+    )?;
+
+    Ok(CollectedFeatures {
+        features: sink.features,
+        report: report.into(),
+    })
+}
+
+#[cfg(feature = "cli")]
+fn run_filter_pipeline_from_path(
+    input: PathBuf,
     compiled: &CompiledFilter,
     index_options: IndexOptions,
     sink: &mut dyn FeatureSink,
     report: &mut FilterReport,
 ) -> Result<()> {
+    run_filter_pipeline(
+        input.clone(),
+        || {
+            File::open(&input).map_err(|source| OsmshrinkError::ReadFile {
+                path: input.clone(),
+                source,
+            })
+        },
+        compiled,
+        index_options,
+        sink,
+        report,
+    )
+}
+
+fn run_filter_pipeline<R, OpenReader>(
+    input: PathBuf,
+    mut open_reader: OpenReader,
+    compiled: &CompiledFilter,
+    index_options: IndexOptions,
+    sink: &mut dyn FeatureSink,
+    report: &mut FilterReport,
+) -> Result<()>
+where
+    R: Read,
+    OpenReader: FnMut() -> Result<R>,
+{
     let includes_way = compiled.includes_type(ElementType::Way);
     let includes_relation = compiled.includes_type(ElementType::Relation);
     let needs_node_index = includes_way || includes_relation;
@@ -168,8 +230,9 @@ fn run_filter_pipeline(
     let mut candidates = Vec::new();
     let mut required_way_ids = HashSet::new();
 
-    process_first_pass_from_pbf(
-        input,
+    process_first_pass_from_reader(
+        &input,
+        open_reader()?,
         compiled,
         node_index.as_mut().map(|index| index as &mut dyn NodeIndex),
         sink,
@@ -180,8 +243,9 @@ fn run_filter_pipeline(
 
     let mut relation_way_geometries = HashMap::new();
     if needs_node_index && (includes_way || !required_way_ids.is_empty()) {
-        process_ways_from_pbf(
-            input,
+        process_ways_from_reader(
+            &input,
+            open_reader()?,
             compiled,
             node_index
                 .as_ref()
@@ -209,8 +273,9 @@ fn run_filter_pipeline(
     Ok(())
 }
 
-fn process_first_pass_from_pbf(
+fn process_first_pass_from_reader<R: Read>(
     input: &std::path::Path,
+    reader: R,
     compiled: &CompiledFilter,
     mut node_index: Option<&mut dyn NodeIndex>,
     sink: &mut dyn FeatureSink,
@@ -218,11 +283,7 @@ fn process_first_pass_from_pbf(
     required_way_ids: &mut HashSet<WayId>,
     report: &mut FilterReport,
 ) -> Result<()> {
-    let file = File::open(input).map_err(|source| OsmshrinkError::ReadFile {
-        path: input.to_path_buf(),
-        source,
-    })?;
-    let mut reader = OsmPbfReader::new(file);
+    let mut reader = OsmPbfReader::new(reader);
     let mut node_batch = Vec::with_capacity(NODE_INDEX_BATCH_SIZE);
     let mut node_features = Vec::new();
     let should_index_nodes = node_index.is_some();
@@ -360,8 +421,9 @@ fn process_node(
     }
 }
 
-fn process_ways_from_pbf(
+fn process_ways_from_reader<R: Read>(
     input: &std::path::Path,
+    reader: R,
     compiled: &CompiledFilter,
     node_index: &dyn NodeIndex,
     required_way_ids: &HashSet<WayId>,
@@ -369,11 +431,7 @@ fn process_ways_from_pbf(
     sink: &mut dyn FeatureSink,
     report: &mut FilterReport,
 ) -> Result<()> {
-    let file = File::open(input).map_err(|source| OsmshrinkError::ReadFile {
-        path: input.to_path_buf(),
-        source,
-    })?;
-    let mut reader = OsmPbfReader::new(file);
+    let mut reader = OsmPbfReader::new(reader);
     for object in reader.iter() {
         let object = object.map_err(|source| OsmshrinkError::Pbf {
             path: input.to_path_buf(),
@@ -538,6 +596,7 @@ fn normalize_tags(tags: &Tags) -> NormalizedTags {
         .collect()
 }
 
+#[cfg(feature = "cli")]
 fn validate_input_path(path: &std::path::Path) -> Result<()> {
     let filename = path
         .file_name()
@@ -556,6 +615,7 @@ trait FeatureSink {
     fn write_feature(&mut self, feature: Feature) -> Result<()>;
 }
 
+#[cfg(feature = "cli")]
 impl FeatureSink for OutputWriter {
     fn write_feature(&mut self, feature: Feature) -> Result<()> {
         OutputWriter::write_feature(self, &feature)
@@ -949,8 +1009,17 @@ enum ConditionOperator {
 
 #[cfg(test)]
 mod tests {
-    use osmpbfreader::{Node, OsmId, Ref, RelationId};
+    #[cfg(feature = "cli")]
+    use std::io::Write;
 
+    use osmpbfreader::{Node, OsmId, Ref, RelationId};
+    #[cfg(feature = "cli")]
+    use osmpbfreader::{fileformat, osmformat};
+    #[cfg(feature = "cli")]
+    use protobuf::Message;
+
+    #[cfg(feature = "cli")]
+    use crate::index::IndexOptions;
     use crate::index::MemoryNodeIndex;
     use crate::spec::{FilterRules, OutputSpec, ProcessingSpec};
 
@@ -1083,6 +1152,75 @@ mod tests {
         Ok((sink.features, report))
     }
 
+    #[cfg(feature = "cli")]
+    fn synthetic_pbf_bytes() -> Vec<u8> {
+        let mut string_table = osmformat::StringTable::new();
+        for value in [
+            "",
+            "amenity",
+            "school",
+            "highway",
+            "residential",
+            "name",
+            "Synthetic Road",
+        ] {
+            string_table.mut_s().push(value.as_bytes().to_vec());
+        }
+
+        let mut dense_nodes = osmformat::DenseNodes::new();
+        let mut previous_id = 0_i64;
+        let mut previous_lat = 0_i64;
+        let mut previous_lon = 0_i64;
+        for (id, lat, lon) in [
+            (1_i64, 480_000_000_i64, 80_000_000_i64),
+            (2, 480_001_000, 80_001_000),
+            (3, 480_002_000, 80_002_000),
+        ] {
+            dense_nodes.id.push(id - previous_id);
+            dense_nodes.lat.push(lat - previous_lat);
+            dense_nodes.lon.push(lon - previous_lon);
+            previous_id = id;
+            previous_lat = lat;
+            previous_lon = lon;
+        }
+        dense_nodes.keys_vals = vec![1, 2, 0, 0, 0];
+
+        let mut way = osmformat::Way::new();
+        way.set_id(10);
+        way.keys = vec![3, 5];
+        way.vals = vec![4, 6];
+        way.refs = vec![1, 1, 1];
+
+        let mut group = osmformat::PrimitiveGroup::new();
+        group.set_dense(dense_nodes);
+        group.mut_ways().push(way);
+
+        let mut block = osmformat::PrimitiveBlock::new();
+        block.set_stringtable(string_table);
+        block.mut_primitivegroup().push(group);
+
+        let mut bytes = Vec::new();
+        write_raw_blob(&mut bytes, "OSMData", block.write_to_bytes().unwrap());
+        bytes
+    }
+
+    #[cfg(feature = "cli")]
+    fn write_raw_blob(writer: &mut Vec<u8>, field_type: &str, payload: Vec<u8>) {
+        let mut blob = fileformat::Blob::new();
+        blob.set_raw(payload);
+        let blob_bytes = blob.write_to_bytes().unwrap();
+
+        let mut header = fileformat::BlobHeader::new();
+        header.set_field_type(field_type.to_owned());
+        header.set_datasize(blob_bytes.len().try_into().unwrap());
+        let header_bytes = header.write_to_bytes().unwrap();
+
+        let header_len: u32 = header_bytes.len().try_into().unwrap();
+        writer.write_all(&header_len.to_be_bytes()).unwrap();
+        writer.write_all(&header_bytes).unwrap();
+        writer.write_all(&blob_bytes).unwrap();
+    }
+
     #[test]
     fn condition_matches_values() {
         let condition = CompiledCondition::compile(&TagCondition {
@@ -1097,6 +1235,50 @@ mod tests {
 
         assert!(condition.matches(&tags(&[("amenity", "school")])));
         assert!(!condition.matches(&tags(&[("amenity", "cafe")])));
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn collect_pbf_bytes_matches_path_collection() {
+        let bytes = synthetic_pbf_bytes();
+        let file = tempfile::NamedTempFile::with_suffix(".osm.pbf").unwrap();
+        std::fs::write(file.path(), &bytes).unwrap();
+        let spec = spec(vec![ElementType::Node, ElementType::Way], None);
+        let index_options = IndexOptions {
+            mode: crate::spec::IndexMode::Memory,
+            memory_node_limit: 10,
+            disk_dir: None,
+        };
+
+        let from_path = collect_pbf(CollectRunOptions {
+            input: file.path().to_path_buf(),
+            spec: spec.clone(),
+            index_options: index_options.clone(),
+        })
+        .unwrap();
+        let from_bytes = collect_pbf_bytes(CollectBytesOptions {
+            input: &bytes,
+            spec,
+            index_options,
+        })
+        .unwrap();
+
+        let path_keys: Vec<_> = from_path
+            .features
+            .iter()
+            .map(|feature| (feature.kind, feature.id))
+            .collect();
+        let byte_keys: Vec<_> = from_bytes
+            .features
+            .iter()
+            .map(|feature| (feature.kind, feature.id))
+            .collect();
+        assert_eq!(byte_keys, path_keys);
+        assert_eq!(
+            from_bytes.report.objects_collected,
+            from_path.report.objects_collected
+        );
+        assert_eq!(from_bytes.report.index_backend, IndexBackend::Memory);
     }
 
     #[test]

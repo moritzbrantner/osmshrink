@@ -6,23 +6,46 @@ description = "Download, filter, and export OpenStreetMap PBF extracts"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-anyhow = "1"
-clap = { version = "4.5", features = ["derive"] }
-futures-util = "0.3"
-geojson = "1"
-indicatif = "0.17"
+anyhow = { version = "1", optional = true }
+clap = { version = "4.5", features = ["derive"], optional = true }
+futures-util = { version = "0.3", optional = true }
+geojson = { version = "1", optional = true }
+indicatif = { version = "0.17", optional = true }
 osmpbfreader = "0.16"
-redb = "4.1"
+redb = { version = "4.1", optional = true }
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
-tempfile = "3"
+serde_yaml = { version = "0.9", optional = true }
+tempfile = { version = "3", optional = true }
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"], optional = true }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+
+[features]
+default = ["cli"]
+cli = [
+    "disk-index",
+    "dep:anyhow",
+    "dep:clap",
+    "dep:futures-util",
+    "dep:geojson",
+    "dep:indicatif",
+    "dep:reqwest",
+    "dep:serde_yaml",
+    "dep:tempfile",
+    "dep:tokio",
+    "dep:tracing-subscriber",
+]
+disk-index = ["dep:redb", "dep:tempfile"]
+wasm = []
+
+[[bin]]
+name = "osmshrink"
+path = "src/main.rs"
+required-features = ["cli"]
 
 [dev-dependencies]
 criterion = "0.5"

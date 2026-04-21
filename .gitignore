@@ -1,4 +1,7 @@
 /target
+/wasm/target
 /data
 /demo/dist
 /demo/node_modules
+/demo/playwright-report
+/demo/test-results

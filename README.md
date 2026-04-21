@@ -238,6 +238,39 @@ npm install
 npm run dev
 ```
 
+The demo can also convert a local `.osm.pbf` or `.pbf` file directly in the
+browser. Conversion runs in a Web Worker through the Rust wasm package; the PBF
+is read from the upload input and no PBF bytes leave the browser. The first
+browser version is upload-only: it does not fetch Geofabrik extracts or arbitrary
+remote PBF URLs.
+
+Browser conversion always uses a memory node index. In wasm builds,
+`processing.index.mode = "auto"` stays in memory and `"disk"` is rejected because
+browser runtimes do not provide the native disk-backed index used by the CLI.
+The demo warns before processing files above 100 MiB and requires explicit
+confirmation for large uploads.
+
+Wasm demo requirements:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-pack
+```
+
+Build the wasm package and start Vite:
+
+```bash
+cd demo
+npm run dev:wasm
+```
+
+Production builds also build the wasm package first:
+
+```bash
+cd demo
+npm run build
+```
+
 Regenerate the sample data:
 
 ```bash

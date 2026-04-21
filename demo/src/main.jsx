@@ -44,11 +44,39 @@ const autoClassKeys = [
 
 const geometryFilterValues = ["Point", "LineString", "Polygon"];
 const typeFilterValues = ["node", "way", "relation"];
+const outputFieldValues = ["id", "type", "tags", "geometry"];
+const mib = 1024 * 1024;
+const largeFileWarningBytes = 100 * mib;
+const hugeFileWarningBytes = 500 * mib;
+
+let nextConditionId = 1;
+
+function createCondition() {
+  return {
+    id: nextConditionId++,
+    key: "",
+    operator: "exists",
+    value: "true",
+    not: false
+  };
+}
 
 function App() {
   const [features, setFeatures] = useState([]);
   const [datasetName, setDatasetName] = useState("Loading Saarland PBF sample");
   const [error, setError] = useState("");
+  const [pbfFile, setPbfFile] = useState(null);
+  const [largeFileConfirmed, setLargeFileConfirmed] = useState(false);
+  const [convertStatus, setConvertStatus] = useState({ state: "idle", message: "" });
+  const [convertReport, setConvertReport] = useState(null);
+  const [pbfTypes, setPbfTypes] = useState(() => new Set(typeFilterValues));
+  const [bbox, setBbox] = useState({ minLon: "", minLat: "", maxLon: "", maxLat: "" });
+  const [geometryMode, setGeometryMode] = useState("full");
+  const [includeMode, setIncludeMode] = useState("any");
+  const [includeConditions, setIncludeConditions] = useState(() => [createCondition()]);
+  const [excludeConditions, setExcludeConditions] = useState(() => []);
+  const [outputFormat, setOutputFormat] = useState("json");
+  const [outputFields, setOutputFields] = useState(() => new Set(outputFieldValues));
   const [search, setSearch] = useState("");
   const [tagKey, setTagKey] = useState("");
   const [tagValue, setTagValue] = useState("");
@@ -58,6 +86,8 @@ function App() {
   const [activeGeometries, setActiveGeometries] = useState(() => new Set(geometryFilterValues));
   const [hiddenLayers, setHiddenLayers] = useState(() => new Set());
   const [selectedKey, setSelectedKey] = useState("");
+  const convertWorkerRef = useRef(null);
+  const convertRequestIdRef = useRef(0);
 
   const tagKeys = useMemo(() => getTagKeys(features), [features]);
 
@@ -78,6 +108,12 @@ function App() {
 
   useEffect(() => {
     loadSample();
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      convertWorkerRef.current?.terminate();
+    };
   }, []);
 
   useEffect(() => {
@@ -104,6 +140,89 @@ function App() {
       setError("");
     } catch (readError) {
       setError(readError instanceof Error ? readError.message : String(readError));
+    }
+  }
+
+  function handlePbfFile(event) {
+    const file = event.target.files?.[0] || null;
+    setPbfFile(file);
+    setLargeFileConfirmed(false);
+    setConvertReport(null);
+    setConvertStatus(file ? { state: "idle", message: formatFileSize(file.size) } : { state: "idle", message: "" });
+  }
+
+  async function convertPbfFile() {
+    if (!pbfFile) {
+      return;
+    }
+
+    let spec;
+    try {
+      spec = buildFilterSpec({
+        pbfTypes,
+        bbox,
+        geometryMode,
+        includeMode,
+        includeConditions,
+        excludeConditions,
+        outputFormat,
+        outputFields
+      });
+    } catch (specError) {
+      setError(specError instanceof Error ? specError.message : String(specError));
+      setConvertStatus({ state: "error", message: "Filter validation failed." });
+      return;
+    }
+
+    try {
+      setError("");
+      setConvertReport(null);
+      setConvertStatus({ state: "running", message: "Reading PBF bytes..." });
+      const buffer = await pbfFile.arrayBuffer();
+      const id = convertRequestIdRef.current + 1;
+      convertRequestIdRef.current = id;
+
+      convertWorkerRef.current?.terminate();
+      const worker = new Worker(new URL("./convertWorker.js", import.meta.url), { type: "module" });
+      convertWorkerRef.current = worker;
+
+      worker.onmessage = (event) => {
+        if (event.data?.id !== id) {
+          return;
+        }
+        if (event.data.type === "done") {
+          const nextFeatures = normalizeMany(event.data.result.features);
+          setFeatures(nextFeatures);
+          setDatasetName(`${pbfFile.name} converted`);
+          setHiddenLayers(new Set());
+          setSelectedKey("");
+          setConvertReport(event.data.result.report);
+          setConvertStatus({ state: "done", message: `${nextFeatures.length} features converted.` });
+          setError("");
+        } else if (event.data.type === "error") {
+          setConvertStatus({ state: "error", message: "Conversion failed." });
+          setError(event.data.error || "Conversion failed.");
+        }
+        worker.terminate();
+        if (convertWorkerRef.current === worker) {
+          convertWorkerRef.current = null;
+        }
+      };
+
+      worker.onerror = (event) => {
+        setConvertStatus({ state: "error", message: "Conversion worker failed." });
+        setError(event.message || "Conversion worker failed.");
+        worker.terminate();
+        if (convertWorkerRef.current === worker) {
+          convertWorkerRef.current = null;
+        }
+      };
+
+      setConvertStatus({ state: "running", message: "Converting in worker..." });
+      worker.postMessage({ type: "convert", id, buffer, spec }, [buffer]);
+    } catch (conversionError) {
+      setConvertStatus({ state: "error", message: "Conversion failed." });
+      setError(conversionError instanceof Error ? conversionError.message : String(conversionError));
     }
   }
 
@@ -134,6 +253,24 @@ function App() {
     setError("");
   }
 
+  function downloadOutput() {
+    try {
+      const text = formatFeaturesForDownload(features, outputFormat, outputFields);
+      const blob = new Blob([text], { type: outputFormat === "geojson" ? "application/geo+json" : "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = downloadName(datasetName, outputFormat);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setError("");
+    } catch (downloadError) {
+      setError(downloadError instanceof Error ? downloadError.message : String(downloadError));
+    }
+  }
+
   function toggleSetValue(setter, value) {
     setter((current) => {
       const next = new Set(current);
@@ -144,6 +281,14 @@ function App() {
       }
       return next;
     });
+  }
+
+  function updateCondition(setter, id, patch) {
+    setter((current) => current.map((condition) => condition.id === id ? { ...condition, ...patch } : condition));
+  }
+
+  function removeCondition(setter, id) {
+    setter((current) => current.filter((condition) => condition.id !== id));
   }
 
   function showAllLayers() {
@@ -178,6 +323,16 @@ function App() {
     }
   }
 
+  const largeFileWarning = pbfFile && pbfFile.size >= largeFileWarningBytes
+    ? {
+        level: pbfFile.size >= hugeFileWarningBytes ? "strong" : "normal",
+        message: pbfFile.size >= hugeFileWarningBytes
+          ? `This ${formatFileSize(pbfFile.size)} file can use substantial browser memory.`
+          : `This ${formatFileSize(pbfFile.size)} file may use significant browser memory.`
+      }
+    : null;
+  const canConvert = pbfFile && convertStatus.state !== "running" && (!largeFileWarning || largeFileConfirmed);
+
   return (
     <main className="app">
       <aside className="sidebar">
@@ -203,6 +358,110 @@ function App() {
               <Stat value={visibleFeatures.length} label="visible" />
               <Stat value={layers.length} label="layers" />
             </div>
+          </section>
+
+          <section className="section">
+            <h2>PBF conversion</h2>
+            <div className="field">
+              <label htmlFor="pbfInput">Local .osm.pbf or .pbf file</label>
+              <input id="pbfInput" type="file" accept=".osm.pbf,.pbf,application/octet-stream" onChange={handlePbfFile} />
+            </div>
+            {largeFileWarning ? (
+              <label className={`confirm ${largeFileWarning.level === "strong" ? "strong" : ""}`}>
+                <input type="checkbox" checked={largeFileConfirmed} onChange={(event) => setLargeFileConfirmed(event.target.checked)} />
+                <span>{largeFileWarning.message}</span>
+              </label>
+            ) : null}
+
+            <FilterCheckboxes
+              title="PBF object types"
+              values={typeFilterValues}
+              labels={{ node: "Node", way: "Way", relation: "Relation" }}
+              active={pbfTypes}
+              onToggle={(value) => toggleSetValue(setPbfTypes, value)}
+            />
+
+            <div className="field-row">
+              <div className="field">
+                <label htmlFor="bboxMinLon">Min lon</label>
+                <input id="bboxMinLon" inputMode="decimal" value={bbox.minLon} placeholder="optional" onChange={(event) => setBbox((current) => ({ ...current, minLon: event.target.value }))} />
+              </div>
+              <div className="field">
+                <label htmlFor="bboxMinLat">Min lat</label>
+                <input id="bboxMinLat" inputMode="decimal" value={bbox.minLat} placeholder="optional" onChange={(event) => setBbox((current) => ({ ...current, minLat: event.target.value }))} />
+              </div>
+            </div>
+            <div className="field-row">
+              <div className="field">
+                <label htmlFor="bboxMaxLon">Max lon</label>
+                <input id="bboxMaxLon" inputMode="decimal" value={bbox.maxLon} placeholder="optional" onChange={(event) => setBbox((current) => ({ ...current, maxLon: event.target.value }))} />
+              </div>
+              <div className="field">
+                <label htmlFor="bboxMaxLat">Max lat</label>
+                <input id="bboxMaxLat" inputMode="decimal" value={bbox.maxLat} placeholder="optional" onChange={(event) => setBbox((current) => ({ ...current, maxLat: event.target.value }))} />
+              </div>
+            </div>
+
+            <div className="field-row">
+              <div className="field">
+                <label htmlFor="geometryMode">Geometry mode</label>
+                <select id="geometryMode" value={geometryMode} onChange={(event) => setGeometryMode(event.target.value)}>
+                  <option value="full">Full</option>
+                  <option value="polygon">Polygon</option>
+                </select>
+              </div>
+              <div className="field">
+                <label htmlFor="includeMode">Include group</label>
+                <select id="includeMode" value={includeMode} onChange={(event) => setIncludeMode(event.target.value)}>
+                  <option value="any">Any</option>
+                  <option value="all">All</option>
+                </select>
+              </div>
+            </div>
+
+            <ConditionList
+              title="Include conditions"
+              conditions={includeConditions}
+              onChange={(id, patch) => updateCondition(setIncludeConditions, id, patch)}
+              onAdd={() => setIncludeConditions((current) => [...current, createCondition()])}
+              onRemove={(id) => removeCondition(setIncludeConditions, id)}
+            />
+            <ConditionList
+              title="Exclude conditions"
+              conditions={excludeConditions}
+              onChange={(id, patch) => updateCondition(setExcludeConditions, id, patch)}
+              onAdd={() => setExcludeConditions((current) => [...current, createCondition()])}
+              onRemove={(id) => removeCondition(setExcludeConditions, id)}
+            />
+
+            <div className="field-row">
+              <div className="field">
+                <label htmlFor="outputFormat">Download format</label>
+                <select id="outputFormat" value={outputFormat} onChange={(event) => setOutputFormat(event.target.value)}>
+                  <option value="json">JSON array</option>
+                  <option value="ndjson">NDJSON</option>
+                  <option value="geojson">GeoJSON</option>
+                </select>
+              </div>
+              <div className="field">
+                <label>Download fields</label>
+                <div className="mini-checks">
+                  {outputFieldValues.map((field) => (
+                    <label className="check" key={field}>
+                      <input type="checkbox" checked={outputFields.has(field)} onChange={() => toggleSetValue(setOutputFields, field)} />
+                      {field}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div className="button-row with-gap">
+              <button className="primary" type="button" disabled={!canConvert} onClick={convertPbfFile}>Convert</button>
+              <button type="button" disabled={!features.length} onClick={downloadOutput}>Download</button>
+            </div>
+            {convertStatus.message ? <div className={`convert-status ${convertStatus.state}`}>{convertStatus.message}</div> : null}
+            {convertReport ? <ReportSummary report={convertReport} /> : null}
           </section>
 
           <section className="section">
@@ -319,6 +578,95 @@ function FilterCheckboxes({ title, values, labels, active, onToggle }) {
         ))}
       </div>
     </div>
+  );
+}
+
+function ConditionList({ title, conditions, onChange, onAdd, onRemove }) {
+  return (
+    <div className="condition-list">
+      <div className="condition-head">
+        <label>{title}</label>
+        <button type="button" onClick={onAdd}>Add</button>
+      </div>
+      {conditions.length ? (
+        conditions.map((condition) => (
+          <div className="condition-item" key={condition.id}>
+            <div className="field">
+              <label htmlFor={`condition-key-${condition.id}`}>Key</label>
+              <input
+                id={`condition-key-${condition.id}`}
+                value={condition.key}
+                placeholder="amenity"
+                onChange={(event) => onChange(condition.id, { key: event.target.value })}
+              />
+            </div>
+            <div className="field">
+              <label htmlFor={`condition-operator-${condition.id}`}>Operator</label>
+              <select
+                id={`condition-operator-${condition.id}`}
+                value={condition.operator}
+                onChange={(event) => onChange(condition.id, { operator: event.target.value, value: event.target.value === "exists" ? "true" : condition.value })}
+              >
+                <option value="exists">exists</option>
+                <option value="value">value</option>
+                <option value="values">values</option>
+                <option value="regex">regex</option>
+              </select>
+            </div>
+            <div className="field condition-value">
+              <label htmlFor={`condition-value-${condition.id}`}>Value</label>
+              {condition.operator === "exists" ? (
+                <select
+                  id={`condition-value-${condition.id}`}
+                  value={condition.value === "false" ? "false" : "true"}
+                  onChange={(event) => onChange(condition.id, { value: event.target.value })}
+                >
+                  <option value="true">true</option>
+                  <option value="false">false</option>
+                </select>
+              ) : (
+                <input
+                  id={`condition-value-${condition.id}`}
+                  value={condition.value}
+                  placeholder={condition.operator === "values" ? "school,hospital" : condition.operator}
+                  onChange={(event) => onChange(condition.id, { value: event.target.value })}
+                />
+              )}
+            </div>
+            <label className="check condition-not">
+              <input type="checkbox" checked={condition.not} onChange={(event) => onChange(condition.id, { not: event.target.checked })} />
+              not
+            </label>
+            <button type="button" onClick={() => onRemove(condition.id)}>Remove</button>
+          </div>
+        ))
+      ) : (
+        <div className="muted">No conditions.</div>
+      )}
+    </div>
+  );
+}
+
+function ReportSummary({ report }) {
+  const rows = [
+    ["collected", report.objects_collected],
+    ["missing way nodes", report.ways_skipped_missing_nodes],
+    ["non-area relations", report.relations_skipped_non_area],
+    ["missing relation members", report.relations_skipped_missing_members],
+    ["invalid relation rings", report.relations_skipped_invalid_rings],
+    ["ignored relation members", report.relation_members_ignored_role],
+    ["index", report.index_backend]
+  ];
+
+  return (
+    <dl className="report-summary">
+      {rows.map(([label, value]) => (
+        <React.Fragment key={label}>
+          <dt>{label}</dt>
+          <dd>{value}</dd>
+        </React.Fragment>
+      ))}
+    </dl>
   );
 }
 
@@ -532,6 +880,189 @@ function parseData(text) {
     .filter(Boolean)
     .map((line, index) => normalizeFeature(JSON.parse(line), index))
     .filter(Boolean);
+}
+
+function buildFilterSpec({
+  pbfTypes,
+  bbox,
+  geometryMode,
+  includeMode,
+  includeConditions,
+  excludeConditions,
+  outputFormat,
+  outputFields
+}) {
+  const types = [...pbfTypes];
+  if (!types.length) {
+    throw new Error("Select at least one PBF object type.");
+  }
+
+  const bboxValues = [bbox.minLon, bbox.minLat, bbox.maxLon, bbox.maxLat].map((value) => value.trim());
+  let parsedBbox = null;
+  if (bboxValues.some(Boolean)) {
+    if (!bboxValues.every(Boolean)) {
+      throw new Error("Fill all four bbox fields, or leave all bbox fields empty.");
+    }
+    parsedBbox = bboxValues.map((value) => Number(value));
+    if (parsedBbox.some((value) => !Number.isFinite(value))) {
+      throw new Error("BBox fields must be numbers.");
+    }
+    if (parsedBbox[0] >= parsedBbox[2] || parsedBbox[1] >= parsedBbox[3]) {
+      throw new Error("BBox minimum values must be smaller than maximum values.");
+    }
+  }
+
+  const include = includeConditions.map(buildCondition).filter(Boolean);
+  const exclude = excludeConditions.map(buildCondition).filter(Boolean);
+  const fields = [...outputFields];
+  if (!fields.length) {
+    throw new Error("Select at least one download field.");
+  }
+  if (outputFormat === "geojson" && !outputFields.has("geometry")) {
+    throw new Error("GeoJSON download requires the geometry field.");
+  }
+
+  const filter = {
+    types,
+    exclude
+  };
+  if (parsedBbox) {
+    filter.bbox = parsedBbox;
+  }
+  if (include.length) {
+    filter.include = includeMode === "all"
+      ? { all: include, any: [] }
+      : { any: include, all: [] };
+  }
+
+  return {
+    filter,
+    processing: {
+      index: {
+        mode: "memory",
+        memory_node_limit: 5000000,
+        disk_dir: null
+      }
+    },
+    output: {
+      format: outputFormat,
+      geometry: geometryMode,
+      fields
+    }
+  };
+}
+
+function buildCondition(condition) {
+  const key = condition.key.trim();
+  const value = condition.value.trim();
+  if (!key && !value) {
+    return null;
+  }
+  if (!key) {
+    throw new Error("Condition key must not be empty.");
+  }
+
+  const next = { key };
+  if (condition.operator === "exists") {
+    next.exists = value !== "false";
+  } else if (condition.operator === "value") {
+    if (!value) {
+      throw new Error(`Condition ${key} requires a value.`);
+    }
+    next.value = value;
+  } else if (condition.operator === "values") {
+    const values = value.split(",").map((item) => item.trim()).filter(Boolean);
+    if (!values.length) {
+      throw new Error(`Condition ${key} requires at least one comma-separated value.`);
+    }
+    next.values = values;
+  } else if (condition.operator === "regex") {
+    if (!value) {
+      throw new Error(`Condition ${key} requires a regex.`);
+    }
+    try {
+      new RegExp(value);
+    } catch (error) {
+      throw new Error(`Regex for ${key} is invalid: ${error.message}`);
+    }
+    next.regex = value;
+  }
+
+  if (condition.not) {
+    next.not = true;
+  }
+  return next;
+}
+
+function formatFeaturesForDownload(features, format, fields) {
+  if (!features.length) {
+    return "";
+  }
+  if (format === "geojson") {
+    if (!fields.has("geometry")) {
+      throw new Error("GeoJSON download requires the geometry field.");
+    }
+    return JSON.stringify({
+      type: "FeatureCollection",
+      features: features.map((feature) => toGeojsonFeature(feature, fields))
+    }, null, 2);
+  }
+
+  const values = features.map((feature) => selectFields(feature, fields));
+  if (format === "ndjson") {
+    return values.map((value) => JSON.stringify(value)).join("\n") + "\n";
+  }
+  return JSON.stringify(values, null, 2);
+}
+
+function selectFields(feature, fields) {
+  const value = {};
+  if (fields.has("id")) {
+    value.id = feature.id;
+  }
+  if (fields.has("type")) {
+    value.type = feature.type;
+  }
+  if (fields.has("tags")) {
+    value.tags = feature.tags;
+  }
+  if (fields.has("geometry")) {
+    value.geometry = feature.geometry;
+  }
+  return value;
+}
+
+function toGeojsonFeature(feature, fields) {
+  const properties = {};
+  if (fields.has("id")) {
+    properties.osm_id = feature.id;
+  }
+  if (fields.has("type")) {
+    properties.osm_type = feature.type;
+  }
+  if (fields.has("tags")) {
+    Object.assign(properties, feature.tags);
+  }
+
+  return {
+    type: "Feature",
+    id: fields.has("id") ? `${feature.type}/${feature.id}` : undefined,
+    properties,
+    geometry: feature.geometry
+  };
+}
+
+function downloadName(datasetName, format) {
+  const base = datasetName.replace(/\.[^.]+$/, "").replace(/[^a-z0-9_-]+/gi, "-").replace(/^-|-$/g, "") || "osmshrink-output";
+  const extension = format === "ndjson" ? "ndjson" : format === "geojson" ? "geojson" : "json";
+  return `${base}.${extension}`;
+}
+
+function formatFileSize(bytes) {
+  if (bytes >= mib) {
+    return `${(bytes / mib).toFixed(bytes >= 100 * mib ? 0 : 1)} MiB`;
+  }
+  return `${Math.max(1, Math.round(bytes / 1024))} KiB`;
 }
 
 function parseGeojsonType(id) {

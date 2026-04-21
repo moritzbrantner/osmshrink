@@ -1,7 +1,9 @@
 use std::collections::HashSet;
-use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "cli")]
+use std::path::Path;
+use std::path::PathBuf;
 
+#[cfg(feature = "cli")]
 use clap::ValueEnum;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -35,11 +37,13 @@ impl Default for FilterSpec {
 }
 
 impl FilterSpec {
+    #[cfg(feature = "cli")]
     pub fn from_path(path: &Path) -> Result<Self> {
-        let contents = fs::read_to_string(path).map_err(|source| OsmshrinkError::ReadFile {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let contents =
+            std::fs::read_to_string(path).map_err(|source| OsmshrinkError::ReadFile {
+                path: path.to_path_buf(),
+                source,
+            })?;
 
         let spec = match path.extension().and_then(|extension| extension.to_str()) {
             Some("json") => {
@@ -62,6 +66,7 @@ impl FilterSpec {
         Ok(spec)
     }
 
+    #[cfg(feature = "cli")]
     pub fn from_filter_arg(input: &str) -> Result<Self> {
         let path = Path::new(input);
         if path.exists() || looks_like_spec_path(path) {
@@ -131,6 +136,7 @@ impl FilterSpec {
     }
 }
 
+#[cfg(feature = "cli")]
 fn looks_like_spec_path(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|extension| extension.to_str()),
@@ -138,6 +144,7 @@ fn looks_like_spec_path(path: &Path) -> bool {
     )
 }
 
+#[cfg(feature = "cli")]
 fn parse_inline<T>(input: &str) -> std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>
 where
     T: for<'de> Deserialize<'de>,
@@ -148,6 +155,15 @@ where
             serde_yaml::from_str(input)
                 .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
         })
+}
+
+#[cfg(not(feature = "cli"))]
+fn parse_inline<T>(input: &str) -> std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_json::from_str(input)
+        .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
 }
 
 fn parse_tag_condition_expression(input: &str) -> Option<TagCondition> {
@@ -202,6 +218,7 @@ fn parse_expression_key(key: &str) -> Option<String> {
     }
 }
 
+#[cfg(feature = "cli")]
 fn parse_spec_unknown_extension(path: &Path, contents: &str) -> Result<FilterSpec> {
     serde_json::from_str(contents)
         .or_else(|_| serde_yaml::from_str(contents))
@@ -351,9 +368,10 @@ impl TagCondition {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[cfg_attr(feature = "cli", derive(ValueEnum))]
 #[serde(rename_all = "lowercase")]
-#[clap(rename_all = "lower")]
+#[cfg_attr(feature = "cli", clap(rename_all = "lower"))]
 pub enum ElementType {
     Node,
     Way,
@@ -401,9 +419,10 @@ impl IndexSpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "cli", derive(ValueEnum))]
 #[serde(rename_all = "lowercase")]
-#[clap(rename_all = "lower")]
+#[cfg_attr(feature = "cli", clap(rename_all = "lower"))]
 pub enum IndexMode {
     #[default]
     Auto,
@@ -456,9 +475,10 @@ impl OutputSpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "cli", derive(ValueEnum))]
 #[serde(rename_all = "lowercase")]
-#[clap(rename_all = "lower")]
+#[cfg_attr(feature = "cli", clap(rename_all = "lower"))]
 pub enum OutputFormat {
     #[default]
     Ndjson,
@@ -467,6 +487,7 @@ pub enum OutputFormat {
 }
 
 impl OutputFormat {
+    #[cfg(feature = "cli")]
     pub fn from_output_path(path: &Path) -> Result<Self> {
         match path.extension().and_then(|extension| extension.to_str()) {
             Some("ndjson") => Ok(Self::Ndjson),
@@ -553,6 +574,7 @@ mod tests {
         assert_eq!(spec.processing.index.mode, IndexMode::Auto);
     }
 
+    #[cfg(feature = "cli")]
     #[test]
     fn parses_spec_from_yaml() {
         let yaml = r#"
@@ -579,6 +601,7 @@ output:
         );
     }
 
+    #[cfg(feature = "cli")]
     #[test]
     fn parses_processing_index_options() {
         let yaml = r#"
@@ -610,6 +633,7 @@ output:
         assert_eq!(spec.output.format, OutputFormat::Json);
     }
 
+    #[cfg(feature = "cli")]
     #[test]
     fn parses_inline_filter_rules() {
         let spec = FilterSpec::from_inline(
@@ -621,6 +645,7 @@ output:
         assert_eq!(spec.filter.include.unwrap().any[0].key, "highway");
     }
 
+    #[cfg(feature = "cli")]
     #[test]
     fn parses_inline_tag_condition_as_include_all() {
         let spec = FilterSpec::from_inline(r#"{key: amenity, value: school}"#).unwrap();
@@ -639,6 +664,7 @@ output:
         assert_eq!(include.all[0].value.as_deref(), Some("school"));
     }
 
+    #[cfg(feature = "cli")]
     #[test]
     fn geojson_requires_geometry_field() {
         let yaml = r#"
@@ -651,6 +677,7 @@ output:
         assert!(error.contains("must include geometry"));
     }
 
+    #[cfg(feature = "cli")]
     #[test]
     fn detects_geojson_output_extension() {
         assert_eq!(

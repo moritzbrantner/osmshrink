@@ -1,15 +1,21 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "disk-index")]
+use std::path::Path;
+use std::path::PathBuf;
 
 use osmpbfreader::NodeId;
+#[cfg(feature = "disk-index")]
 use redb::{Database, ReadableDatabase, TableDefinition};
+#[cfg(feature = "disk-index")]
 use tempfile::{NamedTempFile, TempDir};
 
 use crate::error::{OsmshrinkError, Result};
 use crate::geometry::Coordinate;
 use crate::spec::{IndexMode, IndexSpec};
 
+#[cfg(feature = "disk-index")]
 const NODE_TABLE: TableDefinition<i64, &[u8]> = TableDefinition::new("nodes");
+#[cfg(feature = "disk-index")]
 const STORED_COORDINATE_BYTES: usize = 8;
 
 #[derive(Debug, Clone)]
@@ -95,6 +101,7 @@ impl StoredCoordinate {
         )
     }
 
+    #[cfg(feature = "disk-index")]
     fn to_bytes(self) -> [u8; STORED_COORDINATE_BYTES] {
         let mut bytes = [0_u8; STORED_COORDINATE_BYTES];
         bytes[..4].copy_from_slice(&self.decimicro_lon.to_le_bytes());
@@ -102,6 +109,7 @@ impl StoredCoordinate {
         bytes
     }
 
+    #[cfg(feature = "disk-index")]
     fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != STORED_COORDINATE_BYTES {
             return None;
@@ -141,6 +149,7 @@ impl MemoryNodeIndex {
         Self::default()
     }
 
+    #[cfg(feature = "disk-index")]
     fn drain(self) -> HashMap<NodeId, StoredCoordinate> {
         self.nodes
     }
@@ -173,6 +182,7 @@ impl NodeIndex for MemoryNodeIndex {
     }
 }
 
+#[cfg(feature = "disk-index")]
 #[derive(Debug)]
 pub struct RedbNodeIndex {
     database: Database,
@@ -182,6 +192,7 @@ pub struct RedbNodeIndex {
     len: usize,
 }
 
+#[cfg(feature = "disk-index")]
 impl RedbNodeIndex {
     pub fn create(options: &IndexOptions) -> Result<Self> {
         let (path, temp_file, temp_dir) = index_path(options)?;
@@ -225,6 +236,7 @@ impl RedbNodeIndex {
     }
 }
 
+#[cfg(feature = "disk-index")]
 impl NodeIndex for RedbNodeIndex {
     fn insert(&mut self, node_id: NodeId, coordinate: StoredCoordinate) -> Result<()> {
         self.insert_batch(&[(node_id, coordinate)])
@@ -322,6 +334,7 @@ pub struct AutoNodeIndex {
 #[derive(Debug)]
 enum AutoNodeIndexInner {
     Memory(MemoryNodeIndex),
+    #[cfg(feature = "disk-index")]
     Disk(RedbNodeIndex),
 }
 
@@ -331,11 +344,19 @@ impl AutoNodeIndex {
             IndexMode::Memory | IndexMode::Auto => {
                 AutoNodeIndexInner::Memory(MemoryNodeIndex::new())
             }
+            #[cfg(feature = "disk-index")]
             IndexMode::Disk => AutoNodeIndexInner::Disk(RedbNodeIndex::create(&options)?),
+            #[cfg(not(feature = "disk-index"))]
+            IndexMode::Disk => {
+                return Err(OsmshrinkError::UnsupportedRuntime(
+                    "disk-backed node indexes are not supported in this build".to_owned(),
+                ));
+            }
         };
         Ok(Self { options, inner })
     }
 
+    #[cfg(feature = "disk-index")]
     fn spill_to_disk(&mut self) -> Result<()> {
         let AutoNodeIndexInner::Memory(memory) = std::mem::replace(
             &mut self.inner,
@@ -359,10 +380,12 @@ impl NodeIndex for AutoNodeIndex {
                 if self.options.mode == IndexMode::Auto
                     && memory.len() > self.options.memory_node_limit
                 {
+                    #[cfg(feature = "disk-index")]
                     self.spill_to_disk()?;
                 }
                 Ok(())
             }
+            #[cfg(feature = "disk-index")]
             AutoNodeIndexInner::Disk(disk) => disk.insert(node_id, coordinate),
         }
     }
@@ -374,10 +397,12 @@ impl NodeIndex for AutoNodeIndex {
                 if self.options.mode == IndexMode::Auto
                     && memory.len() > self.options.memory_node_limit
                 {
+                    #[cfg(feature = "disk-index")]
                     self.spill_to_disk()?;
                 }
                 Ok(())
             }
+            #[cfg(feature = "disk-index")]
             AutoNodeIndexInner::Disk(disk) => disk.insert_batch(entries),
         }
     }
@@ -385,6 +410,7 @@ impl NodeIndex for AutoNodeIndex {
     fn get(&self, node_id: NodeId) -> Result<Option<StoredCoordinate>> {
         match &self.inner {
             AutoNodeIndexInner::Memory(memory) => memory.get(node_id),
+            #[cfg(feature = "disk-index")]
             AutoNodeIndexInner::Disk(disk) => disk.get(node_id),
         }
     }
@@ -392,6 +418,7 @@ impl NodeIndex for AutoNodeIndex {
     fn backend(&self) -> IndexBackend {
         match &self.inner {
             AutoNodeIndexInner::Memory(memory) => memory.backend(),
+            #[cfg(feature = "disk-index")]
             AutoNodeIndexInner::Disk(disk) => disk.backend(),
         }
     }
@@ -399,11 +426,13 @@ impl NodeIndex for AutoNodeIndex {
     fn len(&self) -> usize {
         match &self.inner {
             AutoNodeIndexInner::Memory(memory) => memory.len(),
+            #[cfg(feature = "disk-index")]
             AutoNodeIndexInner::Disk(disk) => disk.len(),
         }
     }
 }
 
+#[cfg(feature = "disk-index")]
 fn index_path(options: &IndexOptions) -> Result<(PathBuf, Option<NamedTempFile>, Option<TempDir>)> {
     if let Some(dir) = &options.disk_dir {
         std::fs::create_dir_all(dir).map_err(|source| OsmshrinkError::NodeIndex {
@@ -443,6 +472,7 @@ mod tests {
         assert_eq!(index.backend(), IndexBackend::Memory);
     }
 
+    #[cfg(feature = "disk-index")]
     #[test]
     fn redb_index_round_trips_coordinates() {
         let options = IndexOptions {
@@ -461,6 +491,7 @@ mod tests {
         assert_eq!(index.backend(), IndexBackend::Disk);
     }
 
+    #[cfg(feature = "disk-index")]
     #[test]
     fn redb_index_batch_round_trips_coordinates() {
         let options = IndexOptions {
@@ -488,6 +519,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "disk-index")]
     #[test]
     fn batched_insert_replacement_preserves_len() {
         let options = IndexOptions {
@@ -520,6 +552,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "disk-index")]
     #[test]
     fn auto_index_spills_after_threshold() {
         let options = IndexOptions {
@@ -542,6 +575,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "disk-index")]
     #[test]
     fn auto_index_spills_when_batch_crosses_threshold() {
         let options = IndexOptions {
@@ -564,5 +598,37 @@ mod tests {
             index.get(NodeId(2)).unwrap(),
             Some(StoredCoordinate::new(2, 2))
         );
+    }
+
+    #[cfg(not(feature = "disk-index"))]
+    #[test]
+    fn disk_index_is_rejected_without_disk_feature() {
+        let options = IndexOptions {
+            mode: IndexMode::Disk,
+            memory_node_limit: 1,
+            disk_dir: None,
+        };
+        let error = AutoNodeIndex::create(options).unwrap_err();
+        assert!(matches!(error, OsmshrinkError::UnsupportedRuntime(_)));
+    }
+
+    #[cfg(not(feature = "disk-index"))]
+    #[test]
+    fn auto_index_stays_in_memory_without_disk_feature() {
+        let options = IndexOptions {
+            mode: IndexMode::Auto,
+            memory_node_limit: 1,
+            disk_dir: None,
+        };
+        let mut index = AutoNodeIndex::create(options).unwrap();
+        index
+            .insert_batch(&[
+                (NodeId(1), StoredCoordinate::new(1, 1)),
+                (NodeId(2), StoredCoordinate::new(2, 2)),
+            ])
+            .unwrap();
+
+        assert_eq!(index.backend(), IndexBackend::Memory);
+        assert_eq!(index.len(), 2);
     }
 }

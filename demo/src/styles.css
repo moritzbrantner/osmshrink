@@ -60,6 +60,11 @@ button.primary:hover {
   background: var(--accent-strong);
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 input,
 select {
   width: 100%;
@@ -180,6 +185,130 @@ input[type="checkbox"] {
   gap: 7px;
   min-width: 0;
   white-space: nowrap;
+}
+
+.mini-checks {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 5px 8px;
+  min-height: 36px;
+  align-content: center;
+}
+
+.condition-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.condition-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.condition-head label {
+  color: #334155;
+  font-size: 13px;
+}
+
+.condition-head button {
+  min-height: 30px;
+  padding: 0 10px;
+}
+
+.condition-item {
+  display: grid;
+  grid-template-columns: minmax(70px, 0.9fr) minmax(72px, 0.8fr) minmax(96px, 1.1fr);
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+  background: #fbfcfe;
+}
+
+.condition-item > button {
+  grid-column: 2 / 4;
+  min-height: 30px;
+}
+
+.condition-not {
+  align-self: end;
+  min-height: 30px;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.confirm {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-top: 10px;
+  border: 1px solid #fcd34d;
+  border-radius: 6px;
+  background: #fffbeb;
+  color: #78350f;
+  padding: 9px;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.confirm.strong {
+  border-color: #fb7185;
+  background: #fff1f2;
+  color: #9f1239;
+}
+
+.confirm input {
+  margin-top: 1px;
+  flex: 0 0 auto;
+}
+
+.convert-status {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f8fafc;
+  color: #334155;
+  padding: 8px;
+  font-size: 13px;
+}
+
+.convert-status.done {
+  border-color: #99f6e4;
+  background: #f0fdfa;
+  color: #115e59;
+}
+
+.convert-status.error {
+  border-color: #fecaca;
+  background: #fff1f2;
+  color: #9f1239;
+}
+
+.report-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 5px 10px;
+  margin: 10px 0 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fbfcfe;
+  padding: 8px;
+  font-size: 12px;
+}
+
+.report-summary dt {
+  color: var(--muted);
+}
+
+.report-summary dd {
+  margin: 0;
+  font-weight: 700;
 }
 
 .status {
@@ -458,5 +587,13 @@ input[type="checkbox"] {
 
   .results-grid {
     grid-template-columns: minmax(130px, 1fr) 82px 96px 64px;
+  }
+
+  .condition-item {
+    grid-template-columns: 1fr;
+  }
+
+  .condition-item > button {
+    grid-column: auto;
   }
 }
