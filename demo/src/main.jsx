@@ -4,7 +4,7 @@ import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import "./styles.css";
 
-const sampleUrl = "/saarland-sample.json";
+const sampleUrl = `${import.meta.env.BASE_URL}saarland-sample.json`;
 const sampleName = "Saarland PBF sample";
 
 const palette = [
