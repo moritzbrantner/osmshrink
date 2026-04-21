@@ -535,6 +535,9 @@ impl OutputField {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cli")]
+    use crate::OsmshrinkError;
+
     use super::*;
 
     const JSON_SPEC: &str = r#"
@@ -662,6 +665,47 @@ output:
         let include = spec.filter.include.unwrap();
         assert_eq!(include.all[0].key, "amenity");
         assert_eq!(include.all[0].value.as_deref(), Some("school"));
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn from_path_reports_missing_spec_file() {
+        let path = Path::new("missing-filter-spec.yaml");
+        let error = FilterSpec::from_path(path).unwrap_err();
+
+        assert!(matches!(error, OsmshrinkError::ReadFile { .. }));
+        assert!(error.to_string().contains("missing-filter-spec.yaml"));
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn from_path_reports_malformed_yaml() {
+        let file = tempfile::NamedTempFile::with_suffix(".yaml").unwrap();
+        std::fs::write(file.path(), "filter:\n  types: [node\n").unwrap();
+
+        let error = FilterSpec::from_path(file.path()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            OsmshrinkError::ParseSpec { format: "YAML", .. }
+        ));
+        assert!(error.to_string().contains(file.path().to_str().unwrap()));
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn from_filter_arg_treats_missing_spec_like_path_as_file_error() {
+        let error = FilterSpec::from_filter_arg("does-not-exist.json").unwrap_err();
+
+        assert!(matches!(error, OsmshrinkError::ReadFile { .. }));
+    }
+
+    #[test]
+    fn rejects_inline_expression_with_empty_key() {
+        let error = FilterSpec::from_inline("=school").unwrap_err();
+
+        assert!(matches!(error, OsmshrinkError::InvalidSpec(_)));
+        assert!(error.to_string().contains("inline filter must"));
     }
 
     #[cfg(feature = "cli")]

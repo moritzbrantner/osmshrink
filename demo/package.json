@@ -3,13 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "packageManager": "bun@1.3.13",
   "scripts": {
-    "dev": "npm run dev:wasm",
+    "dev": "bun run dev:wasm",
     "build:wasm": "wasm-pack build ../wasm --target web --out-dir ../demo/src/wasm/pkg --release",
-    "dev:wasm": "npm run build:wasm && vite --host 127.0.0.1",
-    "build": "npm run build:wasm && vite build",
+    "dev:wasm": "bun run build:wasm && vite --host 127.0.0.1",
+    "build": "bun run build:wasm && vite build",
     "preview": "vite preview --host 127.0.0.1",
-    "e2e:server": "npm run build:wasm && vite --host 127.0.0.1 --port 4173",
+    "e2e:server": "bun run build:wasm && vite --host 127.0.0.1 --port 4173",
     "test:e2e": "playwright test"
   },
   "dependencies": {

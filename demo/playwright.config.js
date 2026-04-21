@@ -22,7 +22,7 @@ export default defineConfig({
     }
   ],
   webServer: {
-    command: "npm run e2e:server",
+    command: "bun run e2e:server",
     url: "http://127.0.0.1:4173",
     reuseExistingServer: !process.env.CI,
     timeout: 120_000

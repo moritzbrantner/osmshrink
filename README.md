@@ -234,8 +234,8 @@ Saarland Geofabrik PBF with `examples/saarland_demo.json`.
 
 ```bash
 cd demo
-npm install
-npm run dev
+bun install
+bun run dev
 ```
 
 The demo can also convert a local `.osm.pbf` or `.pbf` file directly in the
@@ -261,14 +261,14 @@ Build the wasm package and start Vite:
 
 ```bash
 cd demo
-npm run dev:wasm
+bun run dev:wasm
 ```
 
 Production builds also build the wasm package first:
 
 ```bash
 cd demo
-npm run build
+bun run build
 ```
 
 Regenerate the sample data:

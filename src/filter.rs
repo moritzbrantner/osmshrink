@@ -1018,9 +1018,7 @@ mod tests {
     #[cfg(feature = "cli")]
     use protobuf::Message;
 
-    #[cfg(feature = "cli")]
-    use crate::index::IndexOptions;
-    use crate::index::MemoryNodeIndex;
+    use crate::index::{IndexOptions, MemoryNodeIndex};
     use crate::spec::{FilterRules, OutputSpec, ProcessingSpec};
 
     use super::*;
@@ -1082,6 +1080,14 @@ mod tests {
             },
             processing: ProcessingSpec::default(),
             output: OutputSpec::default(),
+        }
+    }
+
+    fn memory_index_options() -> IndexOptions {
+        IndexOptions {
+            mode: crate::spec::IndexMode::Memory,
+            memory_node_limit: 10,
+            disk_dir: None,
         }
     }
 
@@ -1237,6 +1243,19 @@ mod tests {
         assert!(!condition.matches(&tags(&[("amenity", "cafe")])));
     }
 
+    #[test]
+    fn collect_pbf_bytes_reports_corrupt_input_as_pbf_error() {
+        let error = collect_pbf_bytes(CollectBytesOptions {
+            input: b"not an osm pbf file",
+            spec: spec(vec![ElementType::Node], None),
+            index_options: memory_index_options(),
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, OsmshrinkError::Pbf { .. }));
+        assert!(error.to_string().contains("<memory>"));
+    }
+
     #[cfg(feature = "cli")]
     #[test]
     fn collect_pbf_bytes_matches_path_collection() {
@@ -1244,11 +1263,7 @@ mod tests {
         let file = tempfile::NamedTempFile::with_suffix(".osm.pbf").unwrap();
         std::fs::write(file.path(), &bytes).unwrap();
         let spec = spec(vec![ElementType::Node, ElementType::Way], None);
-        let index_options = IndexOptions {
-            mode: crate::spec::IndexMode::Memory,
-            memory_node_limit: 10,
-            disk_dir: None,
-        };
+        let index_options = memory_index_options();
 
         let from_path = collect_pbf(CollectRunOptions {
             input: file.path().to_path_buf(),
