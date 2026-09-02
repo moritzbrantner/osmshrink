@@ -8,8 +8,10 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 anyhow = { version = "1", optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
+flatgeobuf = { version = "6.0.1", default-features = false, optional = true }
 futures-util = { version = "0.3", optional = true }
 geojson = "1"
+geozero = { version = "0.15.1", default-features = false, features = ["with-geojson"], optional = true }
 indicatif = { version = "0.17", optional = true }
 osmpbfreader = "0.16"
 redb = { version = "4.1", optional = true }
@@ -28,6 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 default = ["cli"]
 cli = [
     "disk-index",
+    "flatgeobuf",
     "dep:anyhow",
     "dep:clap",
     "dep:futures-util",
@@ -39,6 +42,7 @@ cli = [
     "dep:tracing-subscriber",
 ]
 disk-index = ["dep:redb", "dep:tempfile"]
+flatgeobuf = ["dep:flatgeobuf", "dep:geozero"]
 wasm = []
 
 [[bin]]
