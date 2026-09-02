@@ -8,6 +8,10 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::error::{OsmshrinkError, Result};
+use crate::flatgeobuf_io::{
+    read_flatgeobuf_dataset, stream_flatgeobuf_to_ndjson, stream_ndjson_to_flatgeobuf,
+    write_flatgeobuf_dataset,
+};
 use crate::geo::{GeoDataset, GeoFeature, GeoFeatureId, GeoMetadata};
 use crate::model::Feature;
 
@@ -18,6 +22,7 @@ pub enum GeoFormat {
     Geojson,
     Json,
     Ndjson,
+    Flatgeobuf,
 }
 
 impl GeoFormat {
@@ -26,9 +31,10 @@ impl GeoFormat {
             Some("geojson") => Ok(Self::Geojson),
             Some("json") => Ok(Self::Json),
             Some("ndjson") => Ok(Self::Ndjson),
+            Some("fgb") | Some("flatgeobuf") => Ok(Self::Flatgeobuf),
             _ => Err(OsmshrinkError::UnsupportedGeoFile {
                 path: path.to_path_buf(),
-                expected: ".geojson, .json, or .ndjson",
+                expected: ".geojson, .json, .ndjson, or .fgb",
             }),
         }
     }
@@ -38,6 +44,7 @@ impl GeoFormat {
             Self::Geojson => "geojson",
             Self::Json => "json",
             Self::Ndjson => "ndjson",
+            Self::Flatgeobuf => "flatgeobuf",
         }
     }
 
@@ -46,6 +53,7 @@ impl GeoFormat {
             Self::Geojson => "GeoJSON",
             Self::Json => "JSON",
             Self::Ndjson => "NDJSON",
+            Self::Flatgeobuf => "FlatGeobuf",
         }
     }
 }
@@ -113,10 +121,46 @@ pub fn convert_path(options: ConvertOptions) -> Result<ConversionReport> {
         .output_format
         .unwrap_or(GeoFormat::from_path(&options.output)?);
 
+    if input_format == GeoFormat::Ndjson && output_format == GeoFormat::Flatgeobuf {
+        let features = stream_ndjson_to_flatgeobuf(&options.input, &options.output)?;
+        return Ok(ConversionReport {
+            input: options.input,
+            output: options.output,
+            input_format,
+            output_format,
+            features_read: features,
+            features_written: features,
+            losses: Vec::new(),
+        });
+    }
+
+    if input_format == GeoFormat::Flatgeobuf && output_format == GeoFormat::Ndjson {
+        let report = stream_flatgeobuf_to_ndjson(&options.input, &options.output)?;
+        let losses = conversion_losses(&report.dataset, output_format);
+        return Ok(ConversionReport {
+            input: options.input,
+            output: options.output,
+            input_format,
+            output_format,
+            features_read: report.features,
+            features_written: report.features,
+            losses,
+        });
+    }
+
     let dataset = read_dataset(&options.input, input_format)?;
     let features_read = dataset.features.len();
     let losses = conversion_losses(&dataset, output_format);
-    write_dataset(&options.output, output_format, &dataset)?;
+    let features_written = if output_format == GeoFormat::Flatgeobuf {
+        write_flatgeobuf_dataset(
+            &options.output,
+            &dataset,
+            input_format == GeoFormat::Geojson,
+        )?
+    } else {
+        write_dataset(&options.output, output_format, &dataset)?;
+        dataset.features.len()
+    };
 
     Ok(ConversionReport {
         input: options.input,
@@ -124,7 +168,7 @@ pub fn convert_path(options: ConvertOptions) -> Result<ConversionReport> {
         input_format,
         output_format,
         features_read,
-        features_written: dataset.features.len(),
+        features_written,
         losses,
     })
 }
@@ -143,10 +187,16 @@ pub fn read_dataset(path: &Path, format: GeoFormat) -> Result<GeoDataset> {
             parse_json_dataset(path, &contents)
         }
         GeoFormat::Ndjson => read_ndjson(path),
+        GeoFormat::Flatgeobuf => read_flatgeobuf_dataset(path),
     }
 }
 
 pub fn write_dataset(path: &Path, format: GeoFormat, dataset: &GeoDataset) -> Result<()> {
+    if format == GeoFormat::Flatgeobuf {
+        write_flatgeobuf_dataset(path, dataset, false)?;
+        return Ok(());
+    }
+
     create_parent(path)?;
     let file = File::create(path).map_err(|source| OsmshrinkError::WriteFile {
         path: path.to_path_buf(),
@@ -200,6 +250,7 @@ pub fn write_dataset(path: &Path, format: GeoFormat, dataset: &GeoDataset) -> Re
                     })?;
             }
         }
+        GeoFormat::Flatgeobuf => unreachable!("FlatGeobuf handled before JSON writer setup"),
     }
 
     writer.flush().map_err(|source| OsmshrinkError::WriteFile {
@@ -280,7 +331,11 @@ fn read_ndjson(path: &Path) -> Result<GeoDataset> {
     })
 }
 
-fn parse_ndjson_feature(path: &Path, line_number: usize, line: &str) -> Result<GeoFeature> {
+pub(crate) fn parse_ndjson_feature(
+    path: &Path,
+    line_number: usize,
+    line: &str,
+) -> Result<GeoFeature> {
     if let Ok(feature) = serde_json::from_str::<geojson::Feature>(line) {
         return Ok(feature_from_geojson(feature));
     }
@@ -331,7 +386,7 @@ fn dataset_from_geojson(document: geojson::GeoJson) -> GeoDataset {
     }
 }
 
-fn feature_from_geojson(feature: geojson::Feature) -> GeoFeature {
+pub(crate) fn feature_from_geojson(feature: geojson::Feature) -> GeoFeature {
     GeoFeature {
         id: feature.id.map(GeoFeatureId::from),
         properties: feature.properties.unwrap_or_default(),
@@ -385,11 +440,14 @@ fn crs_name(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn conversion_losses(dataset: &GeoDataset, output_format: GeoFormat) -> Vec<ConversionLoss> {
+pub(crate) fn conversion_losses(
+    dataset: &GeoDataset,
+    output_format: GeoFormat,
+) -> Vec<ConversionLoss> {
     let mut losses = Vec::new();
 
     match output_format {
-        GeoFormat::Json => {}
+        GeoFormat::Json | GeoFormat::Flatgeobuf => {}
         GeoFormat::Ndjson => {
             if dataset.bbox.is_some() || !dataset.metadata.is_empty() {
                 losses.push(ConversionLoss {
@@ -479,6 +537,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn detects_flatgeobuf_extensions() {
+        assert_eq!(
+            GeoFormat::from_path(Path::new("map.fgb")).unwrap(),
+            GeoFormat::Flatgeobuf
+        );
+        assert_eq!(
+            GeoFormat::from_path(Path::new("map.flatgeobuf")).unwrap(),
+            GeoFormat::Flatgeobuf
+        );
+    }
+
+    #[test]
     fn converts_geojson_through_neutral_json_without_losing_feature_data() {
         let dir = tempdir().unwrap();
         let input = dir.path().join("input.geojson");
@@ -537,6 +607,42 @@ mod tests {
         assert_eq!(value["features"][0]["properties"]["active"], true);
         assert_eq!(value["features"][0]["source"], "fixture");
         assert_eq!(value["features"][0]["geometry"]["type"], "MultiPoint");
+    }
+
+    #[test]
+    fn converts_geojson_to_flatgeobuf_and_back() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("input.geojson");
+        let fgb = dir.path().join("output.fgb");
+        let output = dir.path().join("output.geojson");
+        fs::write(
+            &input,
+            r#"{"type":"FeatureCollection","features":[{"type":"Feature","id":"a","properties":{"name":"A","count":2},"geometry":{"type":"Point","coordinates":[8.7,48.9]}}]}"#,
+        )
+        .unwrap();
+
+        let write_report = convert_path(ConvertOptions {
+            input: input.clone(),
+            output: fgb.clone(),
+            input_format: None,
+            output_format: None,
+        })
+        .unwrap();
+        assert!(write_report.is_lossless());
+        assert_eq!(write_report.features_written, 1);
+
+        let read_report = convert_path(ConvertOptions {
+            input: fgb,
+            output: output.clone(),
+            input_format: None,
+            output_format: None,
+        })
+        .unwrap();
+        assert!(read_report.is_lossless());
+        let value: Value = serde_json::from_str(&fs::read_to_string(output).unwrap()).unwrap();
+        assert_eq!(value["features"][0]["id"], "a");
+        assert_eq!(value["features"][0]["properties"]["name"], "A");
+        assert_eq!(value["features"][0]["properties"]["count"], 2);
     }
 
     #[test]
