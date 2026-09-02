@@ -26,6 +26,12 @@ pub enum OsmshrinkError {
         expected: &'static str,
     },
 
+    #[error("unsupported geospatial file `{path}`: expected extension {expected}")]
+    UnsupportedGeoFile {
+        path: PathBuf,
+        expected: &'static str,
+    },
+
     #[error("unable to read `{path}`: {source}")]
     ReadFile {
         path: PathBuf,
@@ -46,6 +52,13 @@ pub enum OsmshrinkError {
         format: &'static str,
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[error("unable to parse geospatial data `{path}` as {format}: {details}")]
+    ParseGeoData {
+        path: PathBuf,
+        format: &'static str,
+        details: String,
     },
 
     #[error("invalid filter spec: {0}")]

@@ -2,16 +2,19 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
 
+use crate::convert::GeoFormat;
 use crate::spec::{IndexMode, OutputFormat};
 
 const CLI_LONG_ABOUT: &str = "\
 Download OpenStreetMap extracts, filter nodes, ways, and area relations from \
-.osm.pbf files, and write compact JSON, NDJSON, or GeoJSON output.";
+.osm.pbf files, and convert common geospatial JSON formats through a reusable \
+neutral feature model.";
 
 const CLI_AFTER_HELP: &str = "\
 Examples:
   osmshrink fetch geofabrik:europe/germany/saarland --output data/saarland.osm.pbf
   osmshrink filter --input data/saarland.osm.pbf --spec examples/schools.json --output out/schools.ndjson
+  osmshrink convert data/features.geojson --output out/features.json
   osmshrink run --source geofabrik:europe/germany/saarland --filter-file examples/schools.json --output out/schools.geojson
 
 Use `osmshrink <COMMAND> --help` for command-specific options.";
@@ -29,6 +32,19 @@ Examples:
   osmshrink filter --input data/saarland.osm.pbf --output out/schools.ndjson amenity=school
   osmshrink filter --input data/saarland.osm.pbf --output out/roads.geojson '{types: [way], include: {any: [{key: highway}]}}'";
 
+const CONVERT_AFTER_HELP: &str = "\
+Input and output formats are normally inferred from .geojson, .json, and .ndjson \
+extensions. Use --from or --to when the extension is ambiguous.
+
+The JSON representation is the neutral GeoDataset envelope and preserves dataset \
+metadata and CRS information. NDJSON contains feature records only, so the \
+conversion report explicitly calls out dataset-level metadata loss.
+
+Examples:
+  osmshrink convert data/features.geojson --output out/features.json
+  osmshrink convert out/features.json --output out/features.ndjson
+  osmshrink convert data/export.json --from geojson --to ndjson --output out/features.ndjson";
+
 const RUN_AFTER_HELP: &str = "\
 Fetches the source extract into a temporary file, filters it, and writes the \
 requested output.
@@ -44,7 +60,7 @@ Examples:
 
 #[derive(Debug, Parser)]
 #[command(name = "osmshrink")]
-#[command(about = "Download and filter OpenStreetMap PBF extracts")]
+#[command(about = "Download, filter, and convert geospatial data")]
 #[command(long_about = CLI_LONG_ABOUT)]
 #[command(after_help = CLI_AFTER_HELP)]
 #[command(arg_required_else_help = true)]
@@ -122,6 +138,26 @@ pub enum Commands {
         /// Node count threshold before auto indexing spills to disk.
         #[arg(long, value_name = "N")]
         memory_node_limit: Option<usize>,
+    },
+
+    /// Convert a geospatial dataset between supported interchange formats.
+    #[command(after_help = CONVERT_AFTER_HELP)]
+    Convert {
+        /// Input geospatial file.
+        #[arg(value_name = "INPUT")]
+        input: PathBuf,
+
+        /// Output geospatial file.
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
+
+        /// Override the input format instead of inferring it from the extension.
+        #[arg(long, value_enum, value_name = "FORMAT")]
+        from: Option<GeoFormat>,
+
+        /// Override the output format instead of inferring it from the extension.
+        #[arg(long, value_enum, value_name = "FORMAT")]
+        to: Option<GeoFormat>,
     },
 
     /// Fetch and filter in one command.

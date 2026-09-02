@@ -2,7 +2,9 @@
 
 `osmshrink` downloads OpenStreetMap regional extracts, filters nodes, ways, and
 area relations from `.osm.pbf` files, and writes normalized `.ndjson`, `.json`,
-or `.geojson` output for downstream data pipelines.
+or `.geojson` output for downstream data pipelines. It also provides a neutral
+geospatial feature model and conversion layer so non-OSM datasets can move between
+supported interchange formats without adopting OSM's node/way/relation model.
 
 The first supported download provider is Geofabrik. Sources can be direct URLs or
 short names such as:
@@ -22,6 +24,11 @@ https://download.geofabrik.de/europe/germany/baden-wuerttemberg-latest.osm.pbf
 OSM extracts are rich but large. `osmshrink` is a small Rust CLI and reusable
 library core for downloading an extract once, applying practical tag and bbox
 filters, and exporting only the data needed by an application.
+
+The same repository also needs to consume datasets that originate outside OSM.
+The geospatial interoperability layer therefore separates OSM-specific processing
+from a format-neutral `GeoFeature` / `GeoDataset` model, with explicit conversion
+loss reporting instead of pretending all geospatial formats are equivalent.
 
 The implementation does not shell out to tools such as `osmium`.
 
@@ -72,6 +79,28 @@ cargo run -- filter --input data/bw.osm.pbf --output out/schools.ndjson '{key: a
 cargo run -- filter --input data/bw.osm.pbf --output out/roads.ndjson '{types: [way], include: {any: [{key: highway, values: [primary, secondary]}]}}'
 cargo run -- filter --input data/bw.osm.pbf -f examples/schools.json --output out/schools.ndjson
 ```
+
+Convert a geospatial dataset:
+
+```bash
+cargo run -- convert data/features.geojson --output out/features.json
+cargo run -- convert out/features.json --output out/features.ndjson
+cargo run -- convert out/features.ndjson --output out/features.geojson
+```
+
+The first conversion batch supports GeoJSON, neutral `GeoDataset` JSON, and
+feature-oriented NDJSON. Existing osmshrink JSON/NDJSON records are accepted and
+promoted into the neutral model. Input/output formats are inferred from extensions;
+use `--from` and `--to` to override detection:
+
+```bash
+cargo run -- convert data/export.json --from geojson --to ndjson --output out/features.data
+```
+
+Conversions report semantic loss. For example, NDJSON cannot carry dataset-level
+metadata or CRS information, while RFC 7946 GeoJSON does not carry a custom CRS
+member. See [`docs/formats.md`](docs/formats.md) for the model, loss semantics,
+and the planned FlatGeobuf, TopoJSON, GeoParquet, GIS, and map-delivery adapters.
 
 Fetch and filter in one command:
 
@@ -187,10 +216,10 @@ Index behavior:
 
 ## Output
 
-`ndjson` is the default and is preferred for large outputs. `json` writes one
-array. `geojson` writes a GeoJSON `FeatureCollection`.
+`ndjson` is the default and is preferred for large OSM filter outputs. `json`
+writes one array. `geojson` writes a GeoJSON `FeatureCollection`.
 
-Each emitted object has a normalized shape:
+Each emitted OSM object has a normalized shape:
 
 ```json
 {
@@ -287,16 +316,21 @@ The crate is split into a reusable library and a CLI:
 - `geofabrik`: shorthand parsing and URL resolution.
 - `spec`: serde models and validation for JSON/YAML specs.
 - `filter`: predicate compilation, PBF filtering pipeline, and area relation assembly.
-- `geometry`: bbox checks and point/way/relation geometry creation.
+- `geometry`: bbox checks and OSM point/way/relation geometry creation.
 - `index`: in-memory, disk-backed, and auto-spilling node coordinate indexes.
-- `model`: normalized output model.
-- `output`: JSON, NDJSON, and GeoJSON writers.
+- `model`: stable OSM-specific normalized output model.
+- `geo`: neutral geospatial feature/dataset model plus reader/writer adapter seam.
+- `convert`: format detection, GeoJSON/JSON/NDJSON adapters, and typed loss reports.
+- `output`: stable OSM JSON, NDJSON, and GeoJSON writers.
 - `inspect`: cheap filesystem-level input inspection.
 - `error`: typed application errors.
 
+The OSM model remains public and backward-compatible. `GeoFeature` / `GeoDataset`
+are an additional interoperability boundary rather than a breaking replacement.
+
 ## Library Use
 
-The emitted data model is available as Rust structs:
+The OSM data model is available as Rust structs:
 
 ```rust
 use osmshrink::{CollectRunOptions, FilterSpec, collect_pbf};
@@ -320,6 +354,22 @@ for feature in collected.features {
 serialization/deserialization, so JSON output can also be read directly into
 `Vec<osmshrink::Feature>` when using array JSON.
 
+For format-independent processing, use `GeoFeature`, `GeoDataset`,
+`GeoFeatureReader`, and `GeoFeatureWriter`. OSM features can be promoted without
+losing their identity:
+
+```rust
+use osmshrink::{Feature, GeoFeature};
+
+fn promote(feature: &Feature) -> GeoFeature {
+    GeoFeature::from_osm(feature)
+}
+```
+
+The streaming `pipe_features` helper connects a `GeoFeatureReader` to a
+`GeoFeatureWriter`. Binary/columnar adapters should implement this seam so large
+files do not need to be materialized into a complete `GeoDataset`.
+
 ## Limitations
 
 - Way geometry requires referenced nodes to exist in the extract. A way with
@@ -329,17 +379,26 @@ serialization/deserialization, so JSON output can also be read directly into
 - Relation assembly supports way members only. Nested relations are ignored.
 - Auto indexing can spill node coordinates to disk, but relation member ways are
   still retained in memory while assembling candidate area relations.
+- The first generic conversion batch supports GeoJSON, neutral JSON, and NDJSON;
+  FlatGeobuf, TopoJSON, GeoParquet, GeoPackage/Shapefile, GPX/KML, and MVT/PMTiles
+  are deliberately staged rather than implemented as ad-hoc parsers in one change.
+- Conversion does not reproject coordinates. CRS incompatibilities are reported
+  rather than silently transformed or relabeled.
 
 ## Tests
 
 ```bash
-cargo test
+cargo test --all-features
 ```
 
 Tests cover Geofabrik shorthand parsing, JSON/YAML spec parsing, condition
-matching, bbox logic, field filtering, GeoJSON output, node indexes, and
-constructed-object relation assembly. Fetch caching is covered by unit,
-integration, and CLI e2e tests using a local HTTP server.
+matching, bbox logic, field filtering, GeoJSON output, node indexes,
+constructed-object relation assembly, neutral OSM feature promotion, adapter
+piping, GeoJSON round trips, legacy osmshrink JSON ingestion, and conversion-loss
+reporting.
+
+Pull requests also run formatting, a no-default-features core check, Clippy across
+all targets/features, and the full test suite in `.github/workflows/ci.yml`.
 
 ## Benchmarks
 
@@ -355,6 +414,11 @@ pipeline using the in-memory node index.
 
 ## Roadmap
 
+- FlatGeobuf adapter through the streaming reader/writer seam.
+- TopoJSON adapter with topology-preservation and explicit topology-loss rules.
+- GeoParquet and established GIS adapters after the streaming contract is proven.
+- GPX/KML interoperability for tracks, routes, and point datasets.
+- MVT/PMTiles output as a separate tiling/generalization layer.
 - Python and Node bindings over the Rust library core.
 - More relation types beyond area relations.
 - Streaming relation member geometry storage for very large relation-heavy extracts.
