@@ -202,12 +202,10 @@ pub fn write_dataset(path: &Path, format: GeoFormat, dataset: &GeoDataset) -> Re
         }
     }
 
-    writer
-        .flush()
-        .map_err(|source| OsmshrinkError::WriteFile {
-            path: path.to_path_buf(),
-            source,
-        })
+    writer.flush().map_err(|source| OsmshrinkError::WriteFile {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn read_to_string(path: &Path) -> Result<String> {
@@ -412,8 +410,9 @@ fn conversion_losses(dataset: &GeoDataset, output_format: GeoFormat) -> Vec<Conv
             if dataset.crs.is_some() {
                 losses.push(ConversionLoss {
                     kind: ConversionLossKind::Crs,
-                    detail: "RFC 7946 GeoJSON uses WGS84/CRS84 and does not carry a custom CRS member"
-                        .to_owned(),
+                    detail:
+                        "RFC 7946 GeoJSON uses WGS84/CRS84 and does not carry a custom CRS member"
+                            .to_owned(),
                 });
             }
             if has_reserved_metadata(dataset) {
