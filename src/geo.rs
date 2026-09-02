@@ -34,6 +34,7 @@ impl From<GeoFeatureId> for geojson::feature::Id {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeoFeature {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<GeoFeatureId>,
@@ -80,6 +81,7 @@ impl From<&Feature> for GeoFeature {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeoDataset {
     #[serde(default)]
     pub features: Vec<GeoFeature>,
@@ -174,7 +176,7 @@ mod tests {
         assert_eq!(geo.properties["highway"], "residential");
         assert!(matches!(
             geo.geometry.as_ref().map(|geometry| &geometry.value),
-            Some(geojson::GeometryValue::LineString { .. })
+            Some(geojson::GeometryValue::LineString(_))
         ));
     }
 
