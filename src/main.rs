@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use osmshrink::cli::{Cli, Commands};
+use osmshrink::convert::{ConversionReport, ConvertOptions, convert_path};
 use osmshrink::fetch::{FetchOptions, download_source};
 use osmshrink::filter::{FilterRunOptions, filter_pbf};
 use osmshrink::index::IndexOptions;
@@ -66,6 +67,22 @@ async fn main() -> anyhow::Result<()> {
             })?;
             if !cli.quiet {
                 print_filter_report(&report);
+            }
+        }
+        Commands::Convert {
+            input,
+            output,
+            from,
+            to,
+        } => {
+            let report = convert_path(ConvertOptions {
+                input,
+                output,
+                input_format: from,
+                output_format: to,
+            })?;
+            if !cli.quiet {
+                print_conversion_report(&report);
             }
         }
         Commands::Run {
@@ -136,6 +153,23 @@ fn read_spec_input(spec: Option<PathBuf>, filter: Option<String>) -> anyhow::Res
         (Some(_), Some(_)) => Err(anyhow::anyhow!(
             "pass either an inline FILTER or --spec <FILE>, not both"
         )),
+    }
+}
+
+fn print_conversion_report(report: &ConversionReport) {
+    eprintln!(
+        "Converted {} features from {} to {} at {}",
+        report.features_written,
+        report.input_format,
+        report.output_format,
+        report.output.display()
+    );
+    if report.losses.is_empty() {
+        eprintln!("Conversion is lossless for the represented dataset metadata.");
+    } else {
+        for loss in &report.losses {
+            eprintln!("Loss [{}]: {}", loss.kind, loss.detail);
+        }
     }
 }
 
