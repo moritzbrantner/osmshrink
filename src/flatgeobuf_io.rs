@@ -179,7 +179,9 @@ pub fn read_flatgeobuf_dataset(path: &Path) -> Result<GeoDataset> {
         .next()
         .map_err(|source| fgb_error(path, source.to_string()))?
     {
-        dataset.features.push(read_feature(path, feature, state_column.as_deref())?);
+        dataset
+            .features
+            .push(read_feature(path, feature, state_column.as_deref())?);
     }
 
     Ok(dataset)
@@ -408,8 +410,8 @@ fn add_feature(
             "FlatGeobuf output requires geometry for every feature; null geometry is not supported by this adapter",
         )
     })?;
-    let geometry_json = serde_json::to_string(geometry)
-        .map_err(|source| fgb_error(path, source.to_string()))?;
+    let geometry_json =
+        serde_json::to_string(geometry).map_err(|source| fgb_error(path, source.to_string()))?;
     let values = encode_properties(path, schema, feature)?;
     let state = FeatureState::from_feature(feature);
     let state_json = (!state.is_empty())
@@ -491,18 +493,24 @@ fn encode_properties(
 
 fn encode_value(path: &Path, kind: PropertyKind, value: &Value) -> Result<OwnedColumnValue> {
     let encoded = match kind {
-        PropertyKind::Bool => OwnedColumnValue::Bool(value.as_bool().ok_or_else(|| {
-            fgb_error(path, "property schema expected a boolean value")
-        })?),
-        PropertyKind::Long => OwnedColumnValue::Long(value.as_i64().ok_or_else(|| {
-            fgb_error(path, "property schema expected a signed integer value")
-        })?),
+        PropertyKind::Bool => OwnedColumnValue::Bool(
+            value
+                .as_bool()
+                .ok_or_else(|| fgb_error(path, "property schema expected a boolean value"))?,
+        ),
+        PropertyKind::Long => {
+            OwnedColumnValue::Long(value.as_i64().ok_or_else(|| {
+                fgb_error(path, "property schema expected a signed integer value")
+            })?)
+        }
         PropertyKind::ULong => OwnedColumnValue::ULong(value.as_u64().ok_or_else(|| {
             fgb_error(path, "property schema expected an unsigned integer value")
         })?),
-        PropertyKind::Double => OwnedColumnValue::Double(value.as_f64().ok_or_else(|| {
-            fgb_error(path, "property schema expected a numeric value")
-        })?),
+        PropertyKind::Double => OwnedColumnValue::Double(
+            value
+                .as_f64()
+                .ok_or_else(|| fgb_error(path, "property schema expected a numeric value"))?,
+        ),
         PropertyKind::String => OwnedColumnValue::String(
             value
                 .as_str()
@@ -597,10 +605,14 @@ fn header_info(header: flatgeobuf::Header<'_>) -> HeaderInfo {
         metadata.insert("flatgeobuf_title".to_owned(), Value::from(title));
     }
     if let Some(description) = header.description() {
-        metadata.insert("flatgeobuf_description".to_owned(), Value::from(description));
+        metadata.insert(
+            "flatgeobuf_description".to_owned(),
+            Value::from(description),
+        );
     }
     if let Some(raw_metadata) = raw_metadata {
-        let value = serde_json::from_str::<Value>(&raw_metadata).unwrap_or(Value::String(raw_metadata));
+        let value =
+            serde_json::from_str::<Value>(&raw_metadata).unwrap_or(Value::String(raw_metadata));
         metadata.insert("flatgeobuf_metadata".to_owned(), value);
     }
 
@@ -732,9 +744,15 @@ mod tests {
         assert_eq!(actual.features[0].id, expected.features[0].id);
         assert_eq!(actual.features[0].bbox, expected.features[0].bbox);
         assert_eq!(actual.features[0].metadata, expected.features[0].metadata);
-        assert_eq!(actual.features[0].properties, expected.features[0].properties);
+        assert_eq!(
+            actual.features[0].properties,
+            expected.features[0].properties
+        );
         assert_eq!(actual.features[1].id, expected.features[1].id);
-        assert_eq!(actual.features[1].properties, expected.features[1].properties);
+        assert_eq!(
+            actual.features[1].properties,
+            expected.features[1].properties
+        );
         assert_eq!(
             actual.features[0].geometry.as_ref().unwrap().value,
             expected.features[0].geometry.as_ref().unwrap().value
@@ -752,7 +770,11 @@ mod tests {
         let fgb = dir.path().join("output.fgb");
         let output = dir.path().join("output.ndjson");
         let feature = &fixture().features[0];
-        fs::write(&input, format!("{}\n", serde_json::to_string(feature).unwrap())).unwrap();
+        fs::write(
+            &input,
+            format!("{}\n", serde_json::to_string(feature).unwrap()),
+        )
+        .unwrap();
 
         assert_eq!(stream_ndjson_to_flatgeobuf(&input, &fgb).unwrap(), 1);
         let report = stream_flatgeobuf_to_ndjson(&fgb, &output).unwrap();
