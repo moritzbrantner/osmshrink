@@ -176,7 +176,7 @@ mod tests {
         assert_eq!(geo.properties["highway"], "residential");
         assert!(matches!(
             geo.geometry.as_ref().map(|geometry| &geometry.value),
-            Some(geojson::GeometryValue::LineString(_))
+            Some(geojson::GeometryValue::LineString { .. })
         ));
     }
 
