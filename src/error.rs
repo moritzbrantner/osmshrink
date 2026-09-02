@@ -61,6 +61,13 @@ pub enum OsmshrinkError {
         details: String,
     },
 
+    #[error("geospatial {format} operation failed for `{path}`: {details}")]
+    GeoData {
+        path: PathBuf,
+        format: &'static str,
+        details: String,
+    },
+
     #[error("invalid filter spec: {0}")]
     InvalidSpec(String),
 
