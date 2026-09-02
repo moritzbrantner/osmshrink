@@ -52,10 +52,7 @@ impl GeoFeature {
     pub fn from_osm(feature: &Feature) -> Self {
         let mut properties = GeoProperties::new();
         properties.insert("osm_id".to_owned(), Value::from(feature.id));
-        properties.insert(
-            "osm_type".to_owned(),
-            Value::from(feature.kind.as_str()),
-        );
+        properties.insert("osm_type".to_owned(), Value::from(feature.kind.as_str()));
         for (key, value) in &feature.tags {
             properties.insert(key.clone(), Value::from(value.clone()));
         }
@@ -167,10 +164,7 @@ mod tests {
         };
 
         let geo = GeoFeature::from_osm(&feature);
-        assert_eq!(
-            geo.id,
-            Some(GeoFeatureId::String("way/42".to_owned()))
-        );
+        assert_eq!(geo.id, Some(GeoFeatureId::String("way/42".to_owned())));
         assert_eq!(geo.properties["osm_id"], 42);
         assert_eq!(geo.properties["osm_type"], "way");
         assert_eq!(geo.properties["highway"], "residential");
