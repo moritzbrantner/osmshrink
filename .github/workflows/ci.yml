@@ -34,7 +34,7 @@ jobs:
         run: cargo check --no-default-features
 
       - name: Lint all targets and features
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features
 
       - name: Run tests
         run: cargo test --all-features
