@@ -6,6 +6,8 @@ pub mod error;
 #[cfg(feature = "cli")]
 pub mod fetch;
 pub mod filter;
+#[cfg(feature = "flatgeobuf")]
+pub mod flatgeobuf_io;
 pub mod geo;
 pub mod geofabrik;
 pub mod geometry;
@@ -28,6 +30,11 @@ pub use filter::{
 };
 #[cfg(feature = "cli")]
 pub use filter::{CollectRunOptions, FilterRunOptions, collect_pbf, filter_pbf};
+#[cfg(feature = "flatgeobuf")]
+pub use flatgeobuf_io::{
+    FlatGeobufStreamReport, read_flatgeobuf_dataset, stream_flatgeobuf_to_ndjson,
+    stream_ndjson_to_flatgeobuf, write_flatgeobuf_dataset,
+};
 pub use geo::{
     GeoDataset, GeoFeature, GeoFeatureId, GeoFeatureReader, GeoFeatureWriter, GeoMetadata,
     GeoProperties, pipe_features,
