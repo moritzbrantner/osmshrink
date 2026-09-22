@@ -641,8 +641,8 @@ fn header_info(header: flatgeobuf::Header<'_>) -> HeaderInfo {
         return HeaderInfo {
             dataset: GeoDataset {
                 features: Vec::new(),
-                bbox: state.bbox.or_else(|| header_bbox(header)),
-                crs: state.crs.or_else(|| header_crs(header)),
+                bbox: state.bbox,
+                crs: state.crs,
                 metadata: state.metadata,
             },
             feature_state_column: Some(state.feature_state_column),
@@ -792,27 +792,15 @@ mod tests {
         assert_eq!(actual.bbox, expected.bbox);
         assert_eq!(actual.crs, expected.crs);
         assert_eq!(actual.metadata, expected.metadata);
-        assert_eq!(actual.features.len(), 2);
-        assert_eq!(actual.features[0].id, expected.features[0].id);
-        assert_eq!(actual.features[0].bbox, expected.features[0].bbox);
-        assert_eq!(actual.features[0].metadata, expected.features[0].metadata);
-        assert_eq!(
-            actual.features[0].properties,
-            expected.features[0].properties
-        );
-        assert_eq!(actual.features[1].id, expected.features[1].id);
-        assert_eq!(
-            actual.features[1].properties,
-            expected.features[1].properties
-        );
-        assert_eq!(
-            actual.features[0].geometry.as_ref().unwrap().value,
-            expected.features[0].geometry.as_ref().unwrap().value
-        );
-        assert_eq!(
-            actual.features[1].geometry.as_ref().unwrap().value,
-            expected.features[1].geometry.as_ref().unwrap().value
-        );
+        assert_eq!(actual.features.len(), expected.features.len());
+        for expected_feature in &expected.features {
+            let actual_feature = actual
+                .features
+                .iter()
+                .find(|feature| feature.id == expected_feature.id)
+                .expect("FlatGeobuf round trip must preserve every feature id");
+            assert_eq!(actual_feature, expected_feature);
+        }
     }
 
     #[test]
