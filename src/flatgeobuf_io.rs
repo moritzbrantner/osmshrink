@@ -4,8 +4,8 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use flatgeobuf::{
-    ColumnType, FallibleStreamingIterator, FgbCrs, FgbReader, FgbWriter, FgbWriterOptions,
-    GeometryType,
+    ColumnType, FallibleStreamingIterator, FeatureProperties, FgbCrs, FgbReader, FgbWriter,
+    FgbWriterOptions, GeometryType,
 };
 use geozero::geojson::GeoJson;
 use geozero::{ColumnValue, PropertyProcessor, ToJson};
@@ -543,17 +543,69 @@ fn finish_writer(path: &Path, writer: FgbWriter<'_>) -> Result<()> {
         .map_err(|source| fgb_error(path, source.to_string()))
 }
 
+#[derive(Default)]
+struct PropertyCollector {
+    properties: GeoMetadata,
+}
+
+impl PropertyProcessor for PropertyCollector {
+    fn property(
+        &mut self,
+        _index: usize,
+        name: &str,
+        value: &ColumnValue<'_>,
+    ) -> geozero::error::Result<bool> {
+        let value = match value {
+            ColumnValue::Bool(value) => Value::from(*value),
+            ColumnValue::Byte(value) => Value::from(*value),
+            ColumnValue::UByte(value) => Value::from(*value),
+            ColumnValue::Short(value) => Value::from(*value),
+            ColumnValue::UShort(value) => Value::from(*value),
+            ColumnValue::Int(value) => Value::from(*value),
+            ColumnValue::UInt(value) => Value::from(*value),
+            ColumnValue::Long(value) => Value::from(*value),
+            ColumnValue::ULong(value) => Value::from(*value),
+            ColumnValue::Float(value) => Value::from(*value as f64),
+            ColumnValue::Double(value) => Value::from(*value),
+            ColumnValue::String(value) | ColumnValue::DateTime(value) => {
+                Value::String((*value).to_owned())
+            }
+            ColumnValue::Json(value) => serde_json::from_str(value).map_err(|source| {
+                geozero::error::GeozeroError::Property(format!(
+                    "invalid JSON property {name}: {source}"
+                ))
+            })?,
+            ColumnValue::Binary(value) => {
+                Value::Array(value.iter().copied().map(Value::from).collect())
+            }
+        };
+        self.properties.insert(name.to_owned(), value);
+        Ok(false)
+    }
+}
+
 fn read_feature(
     path: &Path,
     feature: &flatgeobuf::FgbFeature,
     state_column: Option<&str>,
 ) -> Result<GeoFeature> {
-    let json = feature
+    let geometry_json = feature
         .to_json()
         .map_err(|source| fgb_error(path, source.to_string()))?;
-    let parsed = serde_json::from_str::<geojson::Feature>(&json)
+    let geometry = serde_json::from_str::<geojson::Geometry>(&geometry_json)
         .map_err(|source| fgb_error(path, source.to_string()))?;
-    let mut feature = crate::convert::feature_from_geojson(parsed);
+
+    let mut collector = PropertyCollector::default();
+    feature
+        .process_properties(&mut collector)
+        .map_err(|source| fgb_error(path, source.to_string()))?;
+    let mut feature = GeoFeature {
+        id: None,
+        properties: collector.properties,
+        geometry: Some(geometry),
+        bbox: None,
+        metadata: GeoMetadata::new(),
+    };
 
     if let Some(state_column) = state_column
         && let Some(value) = feature.properties.remove(state_column)
