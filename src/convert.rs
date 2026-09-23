@@ -12,9 +12,7 @@ use crate::flatgeobuf_io::{
     read_flatgeobuf_dataset, stream_flatgeobuf_to_ndjson, stream_ndjson_to_flatgeobuf,
     write_flatgeobuf_dataset,
 };
-use crate::geo::{
-    GeoDataset, GeoFeature, GeoMetadata, feature_from_geojson, parse_ndjson_feature,
-};
+use crate::geo::{GeoDataset, GeoFeature, GeoMetadata, feature_from_geojson, parse_ndjson_feature};
 use crate::model::Feature;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
