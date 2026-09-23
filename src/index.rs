@@ -365,11 +365,12 @@ impl NodeIndex for RedbNodeIndex {
             else {
                 return Ok(None);
             };
-            let coordinate =
-                StoredCoordinate::from_bytes(value.value()).ok_or_else(|| OsmshrinkError::NodeIndex {
+            let coordinate = StoredCoordinate::from_bytes(value.value()).ok_or_else(|| {
+                OsmshrinkError::NodeIndex {
                     path: self.path.clone(),
                     details: "stored coordinate has invalid byte length".to_owned(),
-                })?;
+                }
+            })?;
             coordinates.push(coordinate);
         }
         Ok(Some(coordinates))
