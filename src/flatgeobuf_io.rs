@@ -907,7 +907,7 @@ mod tests {
                 id: Some(GeoFeatureId::String("z-point".to_owned())),
                 properties: GeoMetadata::new(),
                 geometry: Some(geojson::Geometry::new(geojson::GeometryValue::Point {
-                    coordinates: vec![8.7, 48.9, 123.4],
+                    coordinates: vec![8.7, 48.9, 123.4].into(),
                 })),
                 bbox: None,
                 metadata: GeoMetadata::new(),
