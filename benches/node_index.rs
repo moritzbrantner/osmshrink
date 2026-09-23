@@ -29,9 +29,7 @@ fn bench_disk_node_reads(c: &mut Criterion) {
         .insert_batch(&entries)
         .expect("populate benchmark node index");
 
-    let ids: Vec<_> = (1..=LOOKUP_WIDTH)
-        .map(|id| NodeId(id as i64))
-        .collect();
+    let ids: Vec<_> = (1..=LOOKUP_WIDTH).map(|id| NodeId(id as i64)).collect();
 
     let mut group = c.benchmark_group("disk_node_index_reads");
     group.sample_size(20);
@@ -43,7 +41,12 @@ fn bench_disk_node_reads(c: &mut Criterion) {
         b.iter(|| {
             let values: Vec<_> = ids
                 .iter()
-                .map(|id| index.get(*id).expect("lookup succeeds").expect("node exists"))
+                .map(|id| {
+                    index
+                        .get(*id)
+                        .expect("lookup succeeds")
+                        .expect("node exists")
+                })
                 .collect();
             black_box(values);
         });
