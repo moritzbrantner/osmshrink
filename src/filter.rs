@@ -409,12 +409,11 @@ fn process_node(
         return;
     }
 
-    let tags = normalize_tags(tags);
-    if context.compiled.matches_node_tags(&tags) {
+    if context.compiled.matches_node_osm_tags(tags) {
         context.node_features.push(Feature {
             id: node_id.0,
             kind: ElementKind::Node,
-            tags,
+            tags: normalize_tags(tags),
             geometry: point(coordinate),
         });
         context.report.objects_written += 1;
@@ -459,16 +458,16 @@ fn collect_relation(
     required_way_ids: &mut HashSet<WayId>,
     report: &mut FilterReport,
 ) {
-    let tags = normalize_tags(&relation.tags);
-    if !compiled.matches_relation_tags(&tags) {
+    if !compiled.matches_relation_osm_tags(&relation.tags) {
         return;
     }
 
-    if !is_area_relation(&tags) {
+    if !is_area_relation_osm(&relation.tags) {
         report.relations_skipped_non_area += 1;
         return;
     }
 
+    let tags = normalize_tags(&relation.tags);
     let mut members = Vec::new();
     for member in relation.refs {
         let role = member.role.as_str();
@@ -508,12 +507,7 @@ fn process_way(
     report: &mut FilterReport,
 ) -> Result<()> {
     let required_for_relation = required_way_ids.contains(&way.id);
-    let way_tags = compiled
-        .includes_type(ElementType::Way)
-        .then(|| normalize_tags(&way.tags));
-    let matches_way_tags = way_tags
-        .as_ref()
-        .is_some_and(|tags| compiled.matches_way_tags(tags));
+    let matches_way_tags = compiled.matches_way_osm_tags(&way.tags);
 
     if !matches_way_tags && !required_for_relation {
         return Ok(());
@@ -537,7 +531,7 @@ fn process_way(
         sink.write_feature(Feature {
             id: way.id.0,
             kind: ElementKind::Way,
-            tags: way_tags.expect("matching way has normalized tags"),
+            tags: normalize_tags(&way.tags),
             geometry: way_geometry(&coordinates, way.is_closed(), compiled.geometry_mode),
         })?;
         report.objects_written += 1;
@@ -675,9 +669,10 @@ enum RelationAssemblyResult {
     InvalidRings,
 }
 
-fn is_area_relation(tags: &NormalizedTags) -> bool {
+fn is_area_relation_osm(tags: &Tags) -> bool {
     matches!(
-        tags.get("type").map(String::as_str),
+        tags.iter()
+            .find_map(|(key, value)| (key.as_str() == "type").then_some(value.as_str())),
         Some("multipolygon" | "boundary")
     )
 }
@@ -876,6 +871,10 @@ impl CompiledFilter {
         self.types.contains(&ElementType::Node) && self.matches_tags(tags)
     }
 
+    fn matches_node_osm_tags(&self, tags: &Tags) -> bool {
+        self.types.contains(&ElementType::Node) && self.matches_osm_tags(tags)
+    }
+
     fn matches_node_bbox(&self, coordinate: Coordinate) -> bool {
         self.bbox
             .map(|bbox| bbox.contains(coordinate))
@@ -890,6 +889,10 @@ impl CompiledFilter {
         self.types.contains(&ElementType::Way) && self.matches_tags(tags)
     }
 
+    fn matches_way_osm_tags(&self, tags: &Tags) -> bool {
+        self.types.contains(&ElementType::Way) && self.matches_osm_tags(tags)
+    }
+
     fn matches_way_geometry(&self, coordinates: &[Coordinate]) -> bool {
         self.types.contains(&ElementType::Way)
             && self
@@ -900,6 +903,10 @@ impl CompiledFilter {
 
     fn matches_relation_tags(&self, tags: &NormalizedTags) -> bool {
         self.types.contains(&ElementType::Relation) && self.matches_tags(tags)
+    }
+
+    fn matches_relation_osm_tags(&self, tags: &Tags) -> bool {
+        self.types.contains(&ElementType::Relation) && self.matches_osm_tags(tags)
     }
 
     fn matches_relation_geometry(&self, geometry: &Geometry) -> bool {
@@ -927,6 +934,29 @@ impl CompiledFilter {
         self.include_all
             .iter()
             .all(|condition| condition.matches(tags))
+    }
+
+    fn matches_osm_tags(&self, tags: &Tags) -> bool {
+        if self
+            .exclude
+            .iter()
+            .any(|condition| condition.matches_osm(tags))
+        {
+            return false;
+        }
+
+        if !self.include_any.is_empty()
+            && !self
+                .include_any
+                .iter()
+                .any(|condition| condition.matches_osm(tags))
+        {
+            return false;
+        }
+
+        self.include_all
+            .iter()
+            .all(|condition| condition.matches_osm(tags))
     }
 }
 
@@ -997,10 +1027,20 @@ impl CompiledCondition {
     }
 
     pub fn matches(&self, tags: &NormalizedTags) -> bool {
-        let value = tags.get(&self.key);
+        self.matches_value(tags.get(&self.key).map(String::as_str))
+    }
+
+    fn matches_osm(&self, tags: &Tags) -> bool {
+        let value = tags.iter().find_map(|(key, value)| {
+            (key.as_str() == self.key.as_str()).then_some(value.as_str())
+        });
+        self.matches_value(value)
+    }
+
+    fn matches_value(&self, value: Option<&str>) -> bool {
         let matched = match &self.operator {
             ConditionOperator::Exists(expected) => value.is_some() == *expected,
-            ConditionOperator::Value(expected) => value == Some(expected),
+            ConditionOperator::Value(expected) => value == Some(expected.as_str()),
             ConditionOperator::Values(expected) => {
                 value.map(|value| expected.contains(value)).unwrap_or(false)
             }
@@ -1446,6 +1486,51 @@ mod tests {
             from_path.report.objects_collected
         );
         assert_eq!(from_bytes.report.index_backend, IndexBackend::Memory);
+    }
+
+    #[test]
+    fn osm_tag_matching_matches_normalized_tag_matching() {
+        let conditions = [
+            TagCondition {
+                key: "amenity".to_owned(),
+                exists: Some(true),
+                value: None,
+                values: None,
+                regex: None,
+                negate: false,
+            },
+            TagCondition {
+                key: "amenity".to_owned(),
+                exists: None,
+                value: Some("school".to_owned()),
+                values: None,
+                regex: None,
+                negate: false,
+            },
+            TagCondition {
+                key: "amenity".to_owned(),
+                exists: None,
+                value: None,
+                values: Some(vec!["school".to_owned(), "hospital".to_owned()]),
+                regex: None,
+                negate: false,
+            },
+            TagCondition {
+                key: "name".to_owned(),
+                exists: None,
+                value: None,
+                values: None,
+                regex: Some("^Primary".to_owned()),
+                negate: true,
+            },
+        ];
+        let osm = osm_tags(&[("amenity", "school"), ("name", "Primary School")]);
+        let normalized = normalize_tags(&osm);
+
+        for condition in conditions {
+            let compiled = CompiledCondition::compile(&condition).unwrap();
+            assert_eq!(compiled.matches_osm(&osm), compiled.matches(&normalized));
+        }
     }
 
     #[test]
