@@ -566,10 +566,9 @@ fn geometry_has_z(geometry: &geojson::Geometry) -> bool {
         GeometryValue::MultiPoint(positions) | GeometryValue::LineString(positions) => {
             positions.iter().any(|position| position.len() > 2)
         }
-        GeometryValue::MultiLineString(lines) | GeometryValue::Polygon(lines) => lines
-            .iter()
-            .flatten()
-            .any(|position| position.len() > 2),
+        GeometryValue::MultiLineString(lines) | GeometryValue::Polygon(lines) => {
+            lines.iter().flatten().any(|position| position.len() > 2)
+        }
         GeometryValue::MultiPolygon(polygons) => polygons
             .iter()
             .flatten()
@@ -584,10 +583,11 @@ fn reject_same_file(input: &Path, output: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let same = paths_refer_to_same_file(input, output).map_err(|source| OsmshrinkError::ReadFile {
-        path: input.to_path_buf(),
-        source,
-    })?;
+    let same =
+        paths_refer_to_same_file(input, output).map_err(|source| OsmshrinkError::ReadFile {
+            path: input.to_path_buf(),
+            source,
+        })?;
     if same {
         return Err(fgb_error(
             output,
@@ -903,9 +903,9 @@ mod tests {
             features: vec![GeoFeature {
                 id: Some(GeoFeatureId::String("z-point".to_owned())),
                 properties: GeoMetadata::new(),
-                geometry: Some(geojson::Geometry::new(
-                    geojson::GeometryValue::Point(vec![8.7, 48.9, 123.4]),
-                )),
+                geometry: Some(geojson::Geometry::new(geojson::GeometryValue::Point(vec![
+                    8.7, 48.9, 123.4,
+                ]))),
                 bbox: None,
                 metadata: GeoMetadata::new(),
             }],
