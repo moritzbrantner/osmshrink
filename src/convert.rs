@@ -13,8 +13,7 @@ use crate::flatgeobuf_io::{
     write_flatgeobuf_dataset,
 };
 use crate::geo::{
-    GeoDataset, GeoFeature, GeoFeatureId, GeoMetadata, feature_from_geojson,
-    parse_ndjson_feature,
+    GeoDataset, GeoFeature, GeoFeatureId, GeoMetadata, feature_from_geojson, parse_ndjson_feature,
 };
 use crate::model::Feature;
 
@@ -544,7 +543,10 @@ mod tests {
         assert_eq!(report.features_written, 1);
         let dataset: GeoDataset =
             serde_json::from_str(&fs::read_to_string(output).unwrap()).unwrap();
-        assert_eq!(dataset.features[0].id, Some(GeoFeatureId::String("a".to_owned())));
+        assert_eq!(
+            dataset.features[0].id,
+            Some(GeoFeatureId::String("a".to_owned()))
+        );
         assert_eq!(dataset.features[0].properties["rank"], 3);
     }
 
