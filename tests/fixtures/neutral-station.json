@@ -1,0 +1,12 @@
+{
+  "features": [{
+    "id": "station-a",
+    "properties": {"name": "Station A", "rank": 3, "active": true, "nullable": null, "nested": {"source": "survey", "values": [1, false]}},
+    "geometry": {"type": "Point", "coordinates": [8.7, 48.9]},
+    "bbox": [8.7, 48.9, 8.7, 48.9],
+    "metadata": {"source_record": "survey-2026"}
+  }],
+  "bbox": [8.0, 48.0, 9.0, 49.0],
+  "crs": "EPSG:4326",
+  "metadata": {"dataset": "audit interop fixture"}
+}

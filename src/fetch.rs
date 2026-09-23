@@ -4,6 +4,7 @@ use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::io::AsyncWriteExt;
 
+use crate::atomic_output::{create_output, write_error};
 use crate::error::{OsmshrinkError, Result};
 use crate::geofabrik::resolve_source;
 
@@ -68,14 +69,9 @@ pub async fn download_url(url: &str, output: &Path, options: &FetchOptions) -> R
         });
     }
 
-    let tmp_path = partial_path(output);
-    let mut tmp_file =
-        tokio::fs::File::create(&tmp_path)
-            .await
-            .map_err(|source| OsmshrinkError::WriteFile {
-                path: tmp_path.clone(),
-                source,
-            })?;
+    let temp = create_output(output)?;
+    let (file, tmp_path) = temp.into_parts();
+    let mut tmp_file = tokio::fs::File::from_std(file);
 
     let total = response.content_length();
     let progress = progress_bar(total, options.show_progress);
@@ -86,7 +82,6 @@ pub async fn download_url(url: &str, output: &Path, options: &FetchOptions) -> R
         let chunk = match chunk {
             Ok(chunk) => chunk,
             Err(source) => {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
                 return Err(OsmshrinkError::Download {
                     url: url.to_owned(),
                     source,
@@ -97,7 +92,7 @@ pub async fn download_url(url: &str, output: &Path, options: &FetchOptions) -> R
             .write_all(&chunk)
             .await
             .map_err(|source| OsmshrinkError::WriteFile {
-                path: tmp_path.clone(),
+                path: output.to_path_buf(),
                 source,
             })?;
         bytes_written += chunk.len() as u64;
@@ -110,25 +105,29 @@ pub async fn download_url(url: &str, output: &Path, options: &FetchOptions) -> R
         .flush()
         .await
         .map_err(|source| OsmshrinkError::WriteFile {
-            path: tmp_path.clone(),
-            source,
-        })?;
-    drop(tmp_file);
-
-    if output.exists() {
-        tokio::fs::remove_file(output)
-            .await
-            .map_err(|source| OsmshrinkError::WriteFile {
-                path: output.to_path_buf(),
-                source,
-            })?;
-    }
-    tokio::fs::rename(&tmp_path, output)
-        .await
-        .map_err(|source| OsmshrinkError::WriteFile {
             path: output.to_path_buf(),
             source,
         })?;
+    tmp_file
+        .sync_all()
+        .await
+        .map_err(|source| write_error(output, source))?;
+    drop(tmp_file);
+
+    // Without force, a concurrent completed download wins instead of being overwritten.
+    let publication = if options.force {
+        tmp_path.persist(output)
+    } else {
+        tmp_path.persist_noclobber(output)
+    };
+    if let Err(error) = publication {
+        if !options.force && error.error.kind() == std::io::ErrorKind::AlreadyExists {
+            if let Some(report) = cached_report(url, output).await? {
+                return Ok(report);
+            }
+        }
+        return Err(write_error(output, error.error));
+    }
 
     if let Some(progress) = progress {
         progress.finish_and_clear();
@@ -183,14 +182,6 @@ fn progress_bar(total: Option<u64>, show: bool) -> Option<ProgressBar> {
     Some(progress)
 }
 
-fn partial_path(output: &Path) -> PathBuf {
-    let file_name = output
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("download.osm.pbf");
-    output.with_file_name(format!("{file_name}.part"))
-}
-
 fn validate_pbf_output_path(path: &Path) -> Result<()> {
     let filename = path
         .file_name()
@@ -215,14 +206,6 @@ mod tests {
         assert!(validate_pbf_output_path(Path::new("extract.osm.pbf")).is_ok());
         assert!(validate_pbf_output_path(Path::new("extract.pbf")).is_ok());
         assert!(validate_pbf_output_path(Path::new("extract.osm")).is_err());
-    }
-
-    #[test]
-    fn derives_partial_path_next_to_output() {
-        assert_eq!(
-            partial_path(Path::new("data/extract.osm.pbf")),
-            PathBuf::from("data/extract.osm.pbf.part")
-        );
     }
 
     #[tokio::test]

@@ -1,8 +1,12 @@
+#[cfg(feature = "flatgeobuf")]
+mod atomic_output;
 #[cfg(feature = "cli")]
 pub mod cli;
 #[cfg(feature = "cli")]
 pub mod convert;
 pub mod error;
+#[cfg(feature = "flatgeobuf")]
+mod feature_io;
 #[cfg(feature = "cli")]
 pub mod fetch;
 pub mod filter;

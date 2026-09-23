@@ -507,10 +507,21 @@ fn process_way(
     sink: &mut dyn FeatureSink,
     report: &mut FilterReport,
 ) -> Result<()> {
-    let mut coordinates = match coordinates_for_way(&way.nodes, node_index)? {
+    let required_by_relation = required_way_ids.contains(&way.id);
+    let tags = compiled
+        .includes_type(ElementType::Way)
+        .then(|| normalize_tags(&way.tags));
+    let eligible = tags
+        .as_ref()
+        .is_some_and(|tags| compiled.matches_way_tags(tags));
+    if !eligible && !required_by_relation {
+        return Ok(());
+    }
+    let coordinates = match coordinates_for_way(&way.nodes, node_index)? {
         Some(coordinates) => coordinates,
         None => {
-            if compiled.includes_type(ElementType::Way) {
+            // Count only ways eligible for direct output, not already-rejected objects.
+            if eligible {
                 report.ways_skipped_missing_nodes += 1;
                 warn!(
                     way_id = way.id.0,
@@ -520,24 +531,18 @@ fn process_way(
             return Ok(());
         }
     };
-
-    if compiled.includes_type(ElementType::Way) {
-        let tags = normalize_tags(&way.tags);
-        if compiled.matches_way(&tags, &coordinates) {
-            sink.write_feature(Feature {
-                id: way.id.0,
-                kind: ElementKind::Way,
-                tags,
-                geometry: way_geometry(&coordinates, way.is_closed(), compiled.geometry_mode),
-            })?;
-            report.objects_written += 1;
-        }
+    if eligible && compiled.matches_way_bbox(&coordinates) {
+        sink.write_feature(Feature {
+            id: way.id.0,
+            kind: ElementKind::Way,
+            tags: tags.expect("eligible ways have normalized tags"),
+            geometry: way_geometry(&coordinates, way.is_closed(), compiled.geometry_mode),
+        })?;
+        report.objects_written += 1;
     }
-
-    if required_way_ids.contains(&way.id) {
-        relation_way_geometries.insert(way.id, std::mem::take(&mut coordinates));
+    if required_by_relation {
+        relation_way_geometries.insert(way.id, coordinates);
     }
-
     Ok(())
 }
 
@@ -580,14 +585,7 @@ fn coordinates_for_way(
     nodes: &[NodeId],
     node_index: &dyn NodeIndex,
 ) -> Result<Option<Vec<Coordinate>>> {
-    let mut coordinates = Vec::with_capacity(nodes.len());
-    for node_id in nodes {
-        let Some(coordinate) = node_index.get(*node_id)? else {
-            return Ok(None);
-        };
-        coordinates.push(coordinate.to_coordinate());
-    }
-    Ok(Some(coordinates))
+    node_index.resolve_coordinates(nodes)
 }
 
 fn normalize_tags(tags: &Tags) -> NormalizedTags {
@@ -876,12 +874,17 @@ impl CompiledFilter {
     }
 
     pub fn matches_way(&self, tags: &NormalizedTags, coordinates: &[Coordinate]) -> bool {
-        self.types.contains(&ElementType::Way)
-            && self.matches_tags(tags)
-            && self
-                .bbox
-                .map(|bbox| bbox.intersects_any(coordinates))
-                .unwrap_or(true)
+        self.matches_way_tags(tags) && self.matches_way_bbox(coordinates)
+    }
+
+    fn matches_way_tags(&self, tags: &NormalizedTags) -> bool {
+        self.types.contains(&ElementType::Way) && self.matches_tags(tags)
+    }
+
+    fn matches_way_bbox(&self, coordinates: &[Coordinate]) -> bool {
+        self.bbox
+            .map(|bbox| bbox.intersects_any(coordinates))
+            .unwrap_or(true)
     }
 
     fn matches_relation_tags(&self, tags: &NormalizedTags) -> bool {
@@ -1564,3 +1567,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "filter_regressions.rs"]
+mod audit_regressions;

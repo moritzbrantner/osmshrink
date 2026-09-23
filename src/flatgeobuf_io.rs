@@ -12,8 +12,9 @@ use geozero::{ColumnValue, PropertyProcessor, ToJson};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::convert::parse_ndjson_feature;
+use crate::atomic_output::{create_output, publish_output, write_error};
 use crate::error::{OsmshrinkError, Result};
+use crate::feature_io::parse_ndjson_feature;
 use crate::geo::{GeoDataset, GeoFeature, GeoFeatureId, GeoMetadata};
 
 const FGB_METADATA_VERSION: u8 = 1;
@@ -168,6 +169,7 @@ pub fn read_flatgeobuf_dataset(path: &Path) -> Result<GeoDataset> {
     })?;
     let reader = FgbReader::open(BufReader::new(file))
         .map_err(|source| fgb_error(path, source.to_string()))?;
+    validate_header_dimensions(path, reader.header())?;
     let header = header_info(reader.header());
     let state_column = header.feature_state_column.clone();
     let mut dataset = header.dataset;
@@ -259,16 +261,14 @@ pub fn stream_flatgeobuf_to_ndjson(path: &Path, output: &Path) -> Result<FlatGeo
     })?;
     let reader = FgbReader::open(BufReader::new(file))
         .map_err(|source| fgb_error(path, source.to_string()))?;
+    validate_header_dimensions(path, reader.header())?;
     let header = header_info(reader.header());
     let state_column = header.feature_state_column.clone();
     let mut features = reader
         .select_all_seq()
         .map_err(|source| fgb_error(path, source.to_string()))?;
-    let output_file = File::create(output).map_err(|source| OsmshrinkError::WriteFile {
-        path: output.to_path_buf(),
-        source,
-    })?;
-    let mut output_writer = BufWriter::new(output_file);
+    let mut temp = create_output(output)?;
+    let mut output_writer = BufWriter::new(temp.as_file_mut());
     let mut count = 0;
 
     while let Some(feature) = features
@@ -296,6 +296,10 @@ pub fn stream_flatgeobuf_to_ndjson(path: &Path, output: &Path) -> Result<FlatGeo
             path: output.to_path_buf(),
             source,
         })?;
+
+    drop(output_writer);
+    drop(features);
+    publish_output(temp, output)?;
 
     Ok(FlatGeobufStreamReport {
         features: count,
@@ -410,6 +414,7 @@ fn add_feature(
             "FlatGeobuf output requires geometry for every feature; null geometry is not supported by this adapter",
         )
     })?;
+    validate_geometry_xy(path, geometry)?;
     let geometry_json =
         serde_json::to_string(geometry).map_err(|source| fgb_error(path, source.to_string()))?;
     let values = encode_properties(path, schema, feature)?;
@@ -525,22 +530,17 @@ fn encode_value(path: &Path, kind: PropertyKind, value: &Value) -> Result<OwnedC
 }
 
 fn finish_writer(path: &Path, writer: FgbWriter<'_>) -> Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).map_err(|source| OsmshrinkError::WriteFile {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    let file = File::create(path).map_err(|source| OsmshrinkError::WriteFile {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let mut temp = create_output(path)?;
+    write_buffered(path, writer, temp.as_file_mut())?;
+    publish_output(temp, path)
+}
+
+fn write_buffered(path: &Path, writer: FgbWriter<'_>, destination: impl Write) -> Result<()> {
+    let mut buffered = BufWriter::new(destination);
     writer
-        .write(BufWriter::new(file))
-        .map_err(|source| fgb_error(path, source.to_string()))
+        .write(&mut buffered)
+        .map_err(|source| fgb_error(path, source.to_string()))?;
+    buffered.flush().map_err(|source| write_error(path, source))
 }
 
 #[derive(Default)]
@@ -837,3 +837,45 @@ mod tests {
         assert_eq!(schema.feature_state_column, "__osmshrink_feature_1");
     }
 }
+
+fn validate_header_dimensions(path: &Path, header: flatgeobuf::Header<'_>) -> Result<()> {
+    if header.has_z() || header.has_m() || header.has_t() || header.has_tm() {
+        return Err(fgb_error(
+            path,
+            "this adapter supports finite XY coordinates only; Z, M, and time dimensions cannot be silently discarded",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_geometry_xy(path: &Path, geometry: &geojson::Geometry) -> Result<()> {
+    use geojson::GeometryValue::*;
+    let xy = |position: &geojson::Position| {
+        position.len() == 2 && position.as_slice().iter().all(|v| v.is_finite())
+    };
+    let valid = match &geometry.value {
+        Point { coordinates } => xy(coordinates),
+        MultiPoint { coordinates } | LineString { coordinates } => coordinates.iter().all(xy),
+        MultiLineString { coordinates } | Polygon { coordinates } => {
+            coordinates.iter().flatten().all(xy)
+        }
+        MultiPolygon { coordinates } => coordinates.iter().flatten().flatten().all(xy),
+        GeometryCollection { geometries } => {
+            for geometry in geometries {
+                validate_geometry_xy(path, geometry)?;
+            }
+            true
+        }
+    };
+    if !valid {
+        return Err(fgb_error(
+            path,
+            "this adapter supports finite XY coordinates only; additional dimensions cannot be silently discarded",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "flatgeobuf_regressions.rs"]
+mod audit_regressions;

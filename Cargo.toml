@@ -42,7 +42,7 @@ cli = [
     "dep:tracing-subscriber",
 ]
 disk-index = ["dep:redb", "dep:tempfile"]
-flatgeobuf = ["dep:flatgeobuf", "dep:geozero"]
+flatgeobuf = ["dep:flatgeobuf", "dep:geozero", "dep:tempfile"]
 wasm = []
 
 [[bin]]
@@ -57,3 +57,14 @@ protobuf = "2"
 [[bench]]
 name = "filter"
 harness = false
+required-features = ["cli"]
+
+[[bench]]
+name = "index_lookup"
+harness = false
+required-features = ["disk-index"]
+
+[[bench]]
+name = "selective_filter"
+harness = false
+required-features = ["cli"]

@@ -7,12 +7,14 @@ use clap::ValueEnum;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::atomic_output::{create_output, publish_output};
 use crate::error::{OsmshrinkError, Result};
+use crate::feature_io::{feature_from_geojson, parse_ndjson_feature};
 use crate::flatgeobuf_io::{
     read_flatgeobuf_dataset, stream_flatgeobuf_to_ndjson, stream_ndjson_to_flatgeobuf,
     write_flatgeobuf_dataset,
 };
-use crate::geo::{GeoDataset, GeoFeature, GeoFeatureId, GeoMetadata};
+use crate::geo::{GeoDataset, GeoFeature, GeoMetadata};
 use crate::model::Feature;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
@@ -114,12 +116,14 @@ pub struct ConvertOptions {
 }
 
 pub fn convert_path(options: ConvertOptions) -> Result<ConversionReport> {
-    let input_format = options
-        .input_format
-        .unwrap_or(GeoFormat::from_path(&options.input)?);
-    let output_format = options
-        .output_format
-        .unwrap_or(GeoFormat::from_path(&options.output)?);
+    let input_format = match options.input_format {
+        Some(format) => format,
+        None => GeoFormat::from_path(&options.input)?,
+    };
+    let output_format = match options.output_format {
+        Some(format) => format,
+        None => GeoFormat::from_path(&options.output)?,
+    };
 
     if input_format == GeoFormat::Ndjson && output_format == GeoFormat::Flatgeobuf {
         let features = stream_ndjson_to_flatgeobuf(&options.input, &options.output)?;
@@ -197,12 +201,11 @@ pub fn write_dataset(path: &Path, format: GeoFormat, dataset: &GeoDataset) -> Re
         return Ok(());
     }
 
-    create_parent(path)?;
-    let file = File::create(path).map_err(|source| OsmshrinkError::WriteFile {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let mut writer = BufWriter::new(file);
+    if format == GeoFormat::Geojson {
+        validate_geojson_crs(path, dataset)?;
+    }
+    let mut temp = create_output(path)?;
+    let mut writer = BufWriter::new(temp.as_file_mut());
 
     match format {
         GeoFormat::Geojson => {
@@ -256,7 +259,9 @@ pub fn write_dataset(path: &Path, format: GeoFormat, dataset: &GeoDataset) -> Re
     writer.flush().map_err(|source| OsmshrinkError::WriteFile {
         path: path.to_path_buf(),
         source,
-    })
+    })?;
+    drop(writer);
+    publish_output(temp, path)
 }
 
 fn read_to_string(path: &Path) -> Result<String> {
@@ -331,28 +336,6 @@ fn read_ndjson(path: &Path) -> Result<GeoDataset> {
     })
 }
 
-pub(crate) fn parse_ndjson_feature(
-    path: &Path,
-    line_number: usize,
-    line: &str,
-) -> Result<GeoFeature> {
-    if let Ok(feature) = serde_json::from_str::<geojson::Feature>(line) {
-        return Ok(feature_from_geojson(feature));
-    }
-    if let Ok(feature) = serde_json::from_str::<Feature>(line) {
-        return Ok(GeoFeature::from_osm(&feature));
-    }
-    if let Ok(feature) = serde_json::from_str::<GeoFeature>(line) {
-        return Ok(feature);
-    }
-
-    Err(parse_error(
-        path,
-        GeoFormat::Ndjson,
-        format!("line {line_number} is not a supported feature record"),
-    ))
-}
-
 fn dataset_from_geojson(document: geojson::GeoJson) -> GeoDataset {
     match document {
         geojson::GeoJson::FeatureCollection(collection) => {
@@ -383,16 +366,6 @@ fn dataset_from_geojson(document: geojson::GeoJson) -> GeoDataset {
             }],
             ..GeoDataset::default()
         },
-    }
-}
-
-pub(crate) fn feature_from_geojson(feature: geojson::Feature) -> GeoFeature {
-    GeoFeature {
-        id: feature.id.map(GeoFeatureId::from),
-        properties: feature.properties.unwrap_or_default(),
-        geometry: feature.geometry,
-        bbox: feature.bbox,
-        metadata: feature.foreign_members.unwrap_or_default(),
     }
 }
 
@@ -508,19 +481,6 @@ fn sanitize_metadata(metadata: &GeoMetadata, reserved: &[&str]) -> GeoMetadata {
         .collect()
 }
 
-fn create_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).map_err(|source| OsmshrinkError::WriteFile {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-    Ok(())
-}
-
 fn parse_error(path: &Path, format: GeoFormat, details: impl Into<String>) -> OsmshrinkError {
     OsmshrinkError::ParseGeoData {
         path: path.to_path_buf(),
@@ -531,6 +491,7 @@ fn parse_error(path: &Path, format: GeoFormat, details: impl Into<String>) -> Os
 
 #[cfg(test)]
 mod tests {
+    use crate::geo::GeoFeatureId;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -710,4 +671,36 @@ mod tests {
             Some(GeoFeatureId::String("node/7".to_owned()))
         );
     }
+}
+
+fn validate_geojson_crs(path: &Path, dataset: &GeoDataset) -> Result<()> {
+    if let Some(crs) = dataset.crs.as_deref() {
+        let recognized = [
+            "EPSG:4326",
+            "OGC:CRS84",
+            "CRS84",
+            "urn:ogc:def:crs:OGC::CRS84",
+            "urn:ogc:def:crs:EPSG::4326",
+        ];
+        if !recognized
+            .iter()
+            .any(|name| crs.trim().eq_ignore_ascii_case(name))
+        {
+            return Err(OsmshrinkError::GeoData {
+                path: path.to_path_buf(),
+                format: "GeoJSON",
+                details: format!(
+                    "CRS {crs:?} must be explicitly reprojected to WGS84/CRS84 before GeoJSON export; no coordinates were changed"
+                ),
+            });
+        }
+    }
+    if dataset.metadata.contains_key("crs") {
+        return Err(OsmshrinkError::GeoData {
+            path: path.to_path_buf(),
+            format: "GeoJSON",
+            details: "unrecognized CRS metadata must be resolved before GeoJSON export".to_owned(),
+        });
+    }
+    Ok(())
 }

@@ -131,6 +131,19 @@ pub trait NodeIndex {
     }
 
     fn get(&self, node_id: NodeId) -> Result<Option<StoredCoordinate>>;
+
+    /// Resolve an ordered way in one read scope when the backend supports it.
+    /// Preserve duplicate nodes and return None at the first missing reference.
+    fn resolve_coordinates(&self, nodes: &[NodeId]) -> Result<Option<Vec<Coordinate>>> {
+        let mut coordinates = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let Some(coordinate) = self.get(*node)? else {
+                return Ok(None);
+            };
+            coordinates.push(coordinate.to_coordinate());
+        }
+        Ok(Some(coordinates))
+    }
     fn backend(&self) -> IndexBackend;
     fn len(&self) -> usize;
 
@@ -147,11 +160,6 @@ pub struct MemoryNodeIndex {
 impl MemoryNodeIndex {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    #[cfg(feature = "disk-index")]
-    fn drain(self) -> HashMap<NodeId, StoredCoordinate> {
-        self.nodes
     }
 }
 
@@ -190,6 +198,8 @@ pub struct RedbNodeIndex {
     _temp_file: Option<NamedTempFile>,
     _temp_dir: Option<TempDir>,
     len: usize,
+    #[cfg(test)]
+    read_transactions: std::cell::Cell<usize>,
 }
 
 #[cfg(feature = "disk-index")]
@@ -206,6 +216,8 @@ impl RedbNodeIndex {
             _temp_file: temp_file,
             _temp_dir: temp_dir,
             len: 0,
+            #[cfg(test)]
+            read_transactions: std::cell::Cell::new(0),
         };
         index.create_table()?;
         Ok(index)
@@ -285,6 +297,8 @@ impl NodeIndex for RedbNodeIndex {
     }
 
     fn get(&self, node_id: NodeId) -> Result<Option<StoredCoordinate>> {
+        #[cfg(test)]
+        self.read_transactions.set(self.read_transactions.get() + 1);
         let read_txn = self
             .database
             .begin_read()
@@ -314,6 +328,32 @@ impl NodeIndex for RedbNodeIndex {
                 })
             })
             .transpose()
+    }
+
+    fn resolve_coordinates(&self, nodes: &[NodeId]) -> Result<Option<Vec<Coordinate>>> {
+        if nodes.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        #[cfg(test)]
+        self.read_transactions.set(self.read_transactions.get() + 1);
+        let map_error = |source: &dyn std::fmt::Display| OsmshrinkError::NodeIndex {
+            path: self.path.clone(),
+            details: source.to_string(),
+        };
+        let transaction = self.database.begin_read().map_err(|e| map_error(&e))?;
+        let table = transaction
+            .open_table(NODE_TABLE)
+            .map_err(|e| map_error(&e))?;
+        let mut coordinates = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let Some(value) = table.get(node.0).map_err(|e| map_error(&e))? else {
+                return Ok(None);
+            };
+            let coordinate = StoredCoordinate::from_bytes(value.value())
+                .ok_or_else(|| map_error(&"stored coordinate has invalid byte length"))?;
+            coordinates.push(coordinate.to_coordinate());
+        }
+        Ok(Some(coordinates))
     }
 
     fn backend(&self) -> IndexBackend {
@@ -358,15 +398,19 @@ impl AutoNodeIndex {
 
     #[cfg(feature = "disk-index")]
     fn spill_to_disk(&mut self) -> Result<()> {
-        let AutoNodeIndexInner::Memory(memory) = std::mem::replace(
-            &mut self.inner,
-            AutoNodeIndexInner::Memory(MemoryNodeIndex::new()),
-        ) else {
+        let AutoNodeIndexInner::Memory(memory) = &self.inner else {
             return Ok(());
         };
         let mut disk = RedbNodeIndex::create(&self.options)?;
-        let entries: Vec<_> = memory.drain().into_iter().collect();
-        disk.insert_batch(&entries)?;
+        let mut batch = Vec::with_capacity(memory.len().min(16_384));
+        for (&node, &coordinate) in &memory.nodes {
+            batch.push((node, coordinate));
+            if batch.len() == 16_384 {
+                disk.insert_batch(&batch)?;
+                batch.clear();
+            }
+        }
+        disk.insert_batch(&batch)?;
         self.inner = AutoNodeIndexInner::Disk(disk);
         Ok(())
     }
@@ -412,6 +456,14 @@ impl NodeIndex for AutoNodeIndex {
             AutoNodeIndexInner::Memory(memory) => memory.get(node_id),
             #[cfg(feature = "disk-index")]
             AutoNodeIndexInner::Disk(disk) => disk.get(node_id),
+        }
+    }
+
+    fn resolve_coordinates(&self, nodes: &[NodeId]) -> Result<Option<Vec<Coordinate>>> {
+        match &self.inner {
+            AutoNodeIndexInner::Memory(memory) => memory.resolve_coordinates(nodes),
+            #[cfg(feature = "disk-index")]
+            AutoNodeIndexInner::Disk(disk) => disk.resolve_coordinates(nodes),
         }
     }
 
@@ -632,3 +684,7 @@ mod tests {
         assert_eq!(index.len(), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "index_regressions.rs"]
+mod audit_regressions;
