@@ -131,6 +131,18 @@ pub trait NodeIndex {
     }
 
     fn get(&self, node_id: NodeId) -> Result<Option<StoredCoordinate>>;
+
+    fn get_batch(&self, node_ids: &[NodeId]) -> Result<Option<Vec<StoredCoordinate>>> {
+        let mut coordinates = Vec::with_capacity(node_ids.len());
+        for node_id in node_ids {
+            let Some(coordinate) = self.get(*node_id)? else {
+                return Ok(None);
+            };
+            coordinates.push(coordinate);
+        }
+        Ok(Some(coordinates))
+    }
+
     fn backend(&self) -> IndexBackend;
     fn len(&self) -> usize;
 
@@ -171,6 +183,17 @@ impl NodeIndex for MemoryNodeIndex {
 
     fn get(&self, node_id: NodeId) -> Result<Option<StoredCoordinate>> {
         Ok(self.nodes.get(&node_id).copied())
+    }
+
+    fn get_batch(&self, node_ids: &[NodeId]) -> Result<Option<Vec<StoredCoordinate>>> {
+        let mut coordinates = Vec::with_capacity(node_ids.len());
+        for node_id in node_ids {
+            let Some(coordinate) = self.nodes.get(node_id).copied() else {
+                return Ok(None);
+            };
+            coordinates.push(coordinate);
+        }
+        Ok(Some(coordinates))
     }
 
     fn backend(&self) -> IndexBackend {
@@ -316,6 +339,42 @@ impl NodeIndex for RedbNodeIndex {
             .transpose()
     }
 
+    fn get_batch(&self, node_ids: &[NodeId]) -> Result<Option<Vec<StoredCoordinate>>> {
+        let read_txn = self
+            .database
+            .begin_read()
+            .map_err(|source| OsmshrinkError::NodeIndex {
+                path: self.path.clone(),
+                details: source.to_string(),
+            })?;
+        let table =
+            read_txn
+                .open_table(NODE_TABLE)
+                .map_err(|source| OsmshrinkError::NodeIndex {
+                    path: self.path.clone(),
+                    details: source.to_string(),
+                })?;
+        let mut coordinates = Vec::with_capacity(node_ids.len());
+        for node_id in node_ids {
+            let Some(value) = table
+                .get(node_id.0)
+                .map_err(|source| OsmshrinkError::NodeIndex {
+                    path: self.path.clone(),
+                    details: source.to_string(),
+                })?
+            else {
+                return Ok(None);
+            };
+            let coordinate =
+                StoredCoordinate::from_bytes(value.value()).ok_or_else(|| OsmshrinkError::NodeIndex {
+                    path: self.path.clone(),
+                    details: "stored coordinate has invalid byte length".to_owned(),
+                })?;
+            coordinates.push(coordinate);
+        }
+        Ok(Some(coordinates))
+    }
+
     fn backend(&self) -> IndexBackend {
         IndexBackend::Disk
     }
@@ -415,6 +474,14 @@ impl NodeIndex for AutoNodeIndex {
         }
     }
 
+    fn get_batch(&self, node_ids: &[NodeId]) -> Result<Option<Vec<StoredCoordinate>>> {
+        match &self.inner {
+            AutoNodeIndexInner::Memory(memory) => memory.get_batch(node_ids),
+            #[cfg(feature = "disk-index")]
+            AutoNodeIndexInner::Disk(disk) => disk.get_batch(node_ids),
+        }
+    }
+
     fn backend(&self) -> IndexBackend {
         match &self.inner {
             AutoNodeIndexInner::Memory(memory) => memory.backend(),
@@ -460,6 +527,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn memory_index_batch_lookup_preserves_order_and_missing_semantics() {
+        let mut index = MemoryNodeIndex::new();
+        index
+            .insert_batch(&[
+                (NodeId(1), StoredCoordinate::new(10, 20)),
+                (NodeId(2), StoredCoordinate::new(30, 40)),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            index.get_batch(&[NodeId(2), NodeId(1)]).unwrap(),
+            Some(vec![
+                StoredCoordinate::new(30, 40),
+                StoredCoordinate::new(10, 20),
+            ])
+        );
+        assert_eq!(index.get_batch(&[NodeId(1), NodeId(3)]).unwrap(), None);
+    }
+
+    #[test]
     fn memory_index_round_trips_coordinates() {
         let mut index = MemoryNodeIndex::new();
         index
@@ -470,6 +557,32 @@ mod tests {
             Some(StoredCoordinate::new(87_000_000, 489_000_000))
         );
         assert_eq!(index.backend(), IndexBackend::Memory);
+    }
+
+    #[cfg(feature = "disk-index")]
+    #[test]
+    fn redb_index_batch_lookup_preserves_order_and_missing_semantics() {
+        let options = IndexOptions {
+            mode: IndexMode::Disk,
+            memory_node_limit: 1,
+            disk_dir: None,
+        };
+        let mut index = RedbNodeIndex::create(&options).unwrap();
+        index
+            .insert_batch(&[
+                (NodeId(1), StoredCoordinate::new(10, 20)),
+                (NodeId(2), StoredCoordinate::new(30, 40)),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            index.get_batch(&[NodeId(2), NodeId(1)]).unwrap(),
+            Some(vec![
+                StoredCoordinate::new(30, 40),
+                StoredCoordinate::new(10, 20),
+            ])
+        );
+        assert_eq!(index.get_batch(&[NodeId(1), NodeId(3)]).unwrap(), None);
     }
 
     #[cfg(feature = "disk-index")]
