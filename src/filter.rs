@@ -409,12 +409,11 @@ fn process_node(
         return;
     }
 
-    let tags = normalize_tags(tags);
-    if context.compiled.matches_node_tags(&tags) {
+    if context.compiled.matches_node_osm_tags(tags) {
         context.node_features.push(Feature {
             id: node_id.0,
             kind: ElementKind::Node,
-            tags,
+            tags: normalize_tags(tags),
             geometry: point(coordinate),
         });
         context.report.objects_written += 1;
@@ -459,16 +458,16 @@ fn collect_relation(
     required_way_ids: &mut HashSet<WayId>,
     report: &mut FilterReport,
 ) {
-    let tags = normalize_tags(&relation.tags);
-    if !compiled.matches_relation_tags(&tags) {
+    if !compiled.matches_relation_osm_tags(&relation.tags) {
         return;
     }
 
-    if !is_area_relation(&tags) {
+    if !is_area_relation_osm(&relation.tags) {
         report.relations_skipped_non_area += 1;
         return;
     }
 
+    let tags = normalize_tags(&relation.tags);
     let mut members = Vec::new();
     for member in relation.refs {
         let role = member.role.as_str();
@@ -507,10 +506,17 @@ fn process_way(
     sink: &mut dyn FeatureSink,
     report: &mut FilterReport,
 ) -> Result<()> {
+    let required_for_relation = required_way_ids.contains(&way.id);
+    let matches_way_tags = compiled.matches_way_osm_tags(&way.tags);
+
+    if !matches_way_tags && !required_for_relation {
+        return Ok(());
+    }
+
     let mut coordinates = match coordinates_for_way(&way.nodes, node_index)? {
         Some(coordinates) => coordinates,
         None => {
-            if compiled.includes_type(ElementType::Way) {
+            if matches_way_tags {
                 report.ways_skipped_missing_nodes += 1;
                 warn!(
                     way_id = way.id.0,
@@ -521,20 +527,17 @@ fn process_way(
         }
     };
 
-    if compiled.includes_type(ElementType::Way) {
-        let tags = normalize_tags(&way.tags);
-        if compiled.matches_way(&tags, &coordinates) {
-            sink.write_feature(Feature {
-                id: way.id.0,
-                kind: ElementKind::Way,
-                tags,
-                geometry: way_geometry(&coordinates, way.is_closed(), compiled.geometry_mode),
-            })?;
-            report.objects_written += 1;
-        }
+    if matches_way_tags && compiled.matches_way_geometry(&coordinates) {
+        sink.write_feature(Feature {
+            id: way.id.0,
+            kind: ElementKind::Way,
+            tags: normalize_tags(&way.tags),
+            geometry: way_geometry(&coordinates, way.is_closed(), compiled.geometry_mode),
+        })?;
+        report.objects_written += 1;
     }
 
-    if required_way_ids.contains(&way.id) {
+    if required_for_relation {
         relation_way_geometries.insert(way.id, std::mem::take(&mut coordinates));
     }
 
@@ -580,14 +583,12 @@ fn coordinates_for_way(
     nodes: &[NodeId],
     node_index: &dyn NodeIndex,
 ) -> Result<Option<Vec<Coordinate>>> {
-    let mut coordinates = Vec::with_capacity(nodes.len());
-    for node_id in nodes {
-        let Some(coordinate) = node_index.get(*node_id)? else {
-            return Ok(None);
-        };
-        coordinates.push(coordinate.to_coordinate());
-    }
-    Ok(Some(coordinates))
+    Ok(node_index.get_batch(nodes)?.map(|coordinates| {
+        coordinates
+            .into_iter()
+            .map(StoredCoordinate::to_coordinate)
+            .collect()
+    }))
 }
 
 fn normalize_tags(tags: &Tags) -> NormalizedTags {
@@ -668,9 +669,10 @@ enum RelationAssemblyResult {
     InvalidRings,
 }
 
-fn is_area_relation(tags: &NormalizedTags) -> bool {
+fn is_area_relation_osm(tags: &Tags) -> bool {
     matches!(
-        tags.get("type").map(String::as_str),
+        tags.iter()
+            .find_map(|(key, value)| (key.as_str() == "type").then_some(value.as_str())),
         Some("multipolygon" | "boundary")
     )
 }
@@ -869,6 +871,10 @@ impl CompiledFilter {
         self.types.contains(&ElementType::Node) && self.matches_tags(tags)
     }
 
+    fn matches_node_osm_tags(&self, tags: &Tags) -> bool {
+        self.types.contains(&ElementType::Node) && self.matches_osm_tags(tags)
+    }
+
     fn matches_node_bbox(&self, coordinate: Coordinate) -> bool {
         self.bbox
             .map(|bbox| bbox.contains(coordinate))
@@ -876,8 +882,19 @@ impl CompiledFilter {
     }
 
     pub fn matches_way(&self, tags: &NormalizedTags, coordinates: &[Coordinate]) -> bool {
+        self.matches_way_tags(tags) && self.matches_way_geometry(coordinates)
+    }
+
+    fn matches_way_tags(&self, tags: &NormalizedTags) -> bool {
+        self.types.contains(&ElementType::Way) && self.matches_tags(tags)
+    }
+
+    fn matches_way_osm_tags(&self, tags: &Tags) -> bool {
+        self.types.contains(&ElementType::Way) && self.matches_osm_tags(tags)
+    }
+
+    fn matches_way_geometry(&self, coordinates: &[Coordinate]) -> bool {
         self.types.contains(&ElementType::Way)
-            && self.matches_tags(tags)
             && self
                 .bbox
                 .map(|bbox| bbox.intersects_any(coordinates))
@@ -886,6 +903,10 @@ impl CompiledFilter {
 
     fn matches_relation_tags(&self, tags: &NormalizedTags) -> bool {
         self.types.contains(&ElementType::Relation) && self.matches_tags(tags)
+    }
+
+    fn matches_relation_osm_tags(&self, tags: &Tags) -> bool {
+        self.types.contains(&ElementType::Relation) && self.matches_osm_tags(tags)
     }
 
     fn matches_relation_geometry(&self, geometry: &Geometry) -> bool {
@@ -913,6 +934,29 @@ impl CompiledFilter {
         self.include_all
             .iter()
             .all(|condition| condition.matches(tags))
+    }
+
+    fn matches_osm_tags(&self, tags: &Tags) -> bool {
+        if self
+            .exclude
+            .iter()
+            .any(|condition| condition.matches_osm(tags))
+        {
+            return false;
+        }
+
+        if !self.include_any.is_empty()
+            && !self
+                .include_any
+                .iter()
+                .any(|condition| condition.matches_osm(tags))
+        {
+            return false;
+        }
+
+        self.include_all
+            .iter()
+            .all(|condition| condition.matches_osm(tags))
     }
 }
 
@@ -983,10 +1027,20 @@ impl CompiledCondition {
     }
 
     pub fn matches(&self, tags: &NormalizedTags) -> bool {
-        let value = tags.get(&self.key);
+        self.matches_value(tags.get(&self.key).map(String::as_str))
+    }
+
+    fn matches_osm(&self, tags: &Tags) -> bool {
+        let value = tags
+            .iter()
+            .find_map(|(key, value)| (key.as_str() == self.key.as_str()).then_some(value.as_str()));
+        self.matches_value(value)
+    }
+
+    fn matches_value(&self, value: Option<&str>) -> bool {
         let matched = match &self.operator {
             ConditionOperator::Exists(expected) => value.is_some() == *expected,
-            ConditionOperator::Value(expected) => value == Some(expected),
+            ConditionOperator::Value(expected) => value == Some(expected.as_str()),
             ConditionOperator::Values(expected) => {
                 value.map(|value| expected.contains(value)).unwrap_or(false)
             }
@@ -1009,6 +1063,7 @@ enum ConditionOperator {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     #[cfg(feature = "cli")]
     use std::io::Write;
 
@@ -1088,6 +1143,52 @@ mod tests {
             mode: crate::spec::IndexMode::Memory,
             memory_node_limit: 10,
             disk_dir: None,
+        }
+    }
+
+    struct CountingNodeIndex {
+        inner: MemoryNodeIndex,
+        single_gets: Cell<usize>,
+        batch_gets: Cell<usize>,
+    }
+
+    impl CountingNodeIndex {
+        fn with_nodes(entries: &[(NodeId, StoredCoordinate)]) -> Self {
+            let mut inner = MemoryNodeIndex::new();
+            inner.insert_batch(entries).unwrap();
+            Self {
+                inner,
+                single_gets: Cell::new(0),
+                batch_gets: Cell::new(0),
+            }
+        }
+    }
+
+    impl NodeIndex for CountingNodeIndex {
+        fn insert(&mut self, node_id: NodeId, coordinate: StoredCoordinate) -> Result<()> {
+            self.inner.insert(node_id, coordinate)
+        }
+
+        fn insert_batch(&mut self, entries: &[(NodeId, StoredCoordinate)]) -> Result<()> {
+            self.inner.insert_batch(entries)
+        }
+
+        fn get(&self, node_id: NodeId) -> Result<Option<StoredCoordinate>> {
+            self.single_gets.set(self.single_gets.get() + 1);
+            self.inner.get(node_id)
+        }
+
+        fn get_batch(&self, node_ids: &[NodeId]) -> Result<Option<Vec<StoredCoordinate>>> {
+            self.batch_gets.set(self.batch_gets.get() + 1);
+            self.inner.get_batch(node_ids)
+        }
+
+        fn backend(&self) -> IndexBackend {
+            self.inner.backend()
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
         }
     }
 
@@ -1228,6 +1329,97 @@ mod tests {
     }
 
     #[test]
+    fn rejected_way_skips_geometry_lookup_entirely() {
+        let include = Some(IncludeRules {
+            any: vec![TagCondition {
+                key: "highway".to_owned(),
+                exists: None,
+                value: Some("residential".to_owned()),
+                values: None,
+                regex: None,
+                negate: false,
+            }],
+            all: Vec::new(),
+        });
+        let compiled = CompiledFilter::compile(&spec(vec![ElementType::Way], include)).unwrap();
+        let index = CountingNodeIndex::with_nodes(&[
+            (NodeId(1), StoredCoordinate::from_degrees(8.7, 48.9)),
+            (NodeId(2), StoredCoordinate::from_degrees(8.8, 49.0)),
+        ]);
+        let way = Way {
+            id: WayId(7),
+            tags: osm_tags(&[("highway", "service")]),
+            nodes: vec![NodeId(1), NodeId(2)],
+        };
+        let mut sink = VecFeatureSink::new();
+        let mut report = FilterReport::new(PathBuf::from("test.ndjson"));
+
+        process_way(
+            &way,
+            &compiled,
+            &index,
+            &HashSet::new(),
+            &mut HashMap::new(),
+            &mut sink,
+            &mut report,
+        )
+        .unwrap();
+
+        assert_eq!(index.single_gets.get(), 0);
+        assert_eq!(index.batch_gets.get(), 0);
+        assert!(sink.features.is_empty());
+    }
+
+    #[test]
+    fn required_relation_way_uses_one_batch_lookup_even_when_direct_filter_rejects_it() {
+        let include = Some(IncludeRules {
+            any: vec![TagCondition {
+                key: "highway".to_owned(),
+                exists: None,
+                value: Some("residential".to_owned()),
+                values: None,
+                regex: None,
+                negate: false,
+            }],
+            all: Vec::new(),
+        });
+        let compiled = CompiledFilter::compile(&spec(
+            vec![ElementType::Way, ElementType::Relation],
+            include,
+        ))
+        .unwrap();
+        let index = CountingNodeIndex::with_nodes(&[
+            (NodeId(1), StoredCoordinate::from_degrees(8.7, 48.9)),
+            (NodeId(2), StoredCoordinate::from_degrees(8.8, 49.0)),
+        ]);
+        let way = Way {
+            id: WayId(7),
+            tags: osm_tags(&[("highway", "service")]),
+            nodes: vec![NodeId(1), NodeId(2)],
+        };
+        let required = HashSet::from([WayId(7)]);
+        let mut geometries = HashMap::new();
+        let mut sink = VecFeatureSink::new();
+        let mut report = FilterReport::new(PathBuf::from("test.ndjson"));
+
+        process_way(
+            &way,
+            &compiled,
+            &index,
+            &required,
+            &mut geometries,
+            &mut sink,
+            &mut report,
+        )
+        .unwrap();
+
+        assert_eq!(index.single_gets.get(), 0);
+        assert_eq!(index.batch_gets.get(), 1);
+        assert_eq!(geometries.get(&WayId(7)).map(Vec::len), Some(2));
+        assert!(sink.features.is_empty());
+    }
+
+    #[test]
     fn condition_matches_values() {
         let condition = CompiledCondition::compile(&TagCondition {
             key: "amenity".to_owned(),
@@ -1294,6 +1486,51 @@ mod tests {
             from_path.report.objects_collected
         );
         assert_eq!(from_bytes.report.index_backend, IndexBackend::Memory);
+    }
+
+    #[test]
+    fn osm_tag_matching_matches_normalized_tag_matching() {
+        let conditions = [
+            TagCondition {
+                key: "amenity".to_owned(),
+                exists: Some(true),
+                value: None,
+                values: None,
+                regex: None,
+                negate: false,
+            },
+            TagCondition {
+                key: "amenity".to_owned(),
+                exists: None,
+                value: Some("school".to_owned()),
+                values: None,
+                regex: None,
+                negate: false,
+            },
+            TagCondition {
+                key: "amenity".to_owned(),
+                exists: None,
+                value: None,
+                values: Some(vec!["school".to_owned(), "hospital".to_owned()]),
+                regex: None,
+                negate: false,
+            },
+            TagCondition {
+                key: "name".to_owned(),
+                exists: None,
+                value: None,
+                values: None,
+                regex: Some("^Primary".to_owned()),
+                negate: true,
+            },
+        ];
+        let osm = osm_tags(&[("amenity", "school"), ("name", "Primary School")]);
+        let normalized = normalize_tags(&osm);
+
+        for condition in conditions {
+            let compiled = CompiledCondition::compile(&condition).unwrap();
+            assert_eq!(compiled.matches_osm(&osm), compiled.matches(&normalized));
+        }
     }
 
     #[test]
