@@ -13,7 +13,7 @@ use crate::flatgeobuf_io::{
     write_flatgeobuf_dataset,
 };
 use crate::geo::{
-    GeoDataset, GeoFeature, GeoFeatureId, GeoMetadata, feature_from_geojson, parse_ndjson_feature,
+    GeoDataset, GeoFeature, GeoMetadata, feature_from_geojson, parse_ndjson_feature,
 };
 use crate::model::Feature;
 
@@ -504,6 +504,8 @@ fn parse_error(path: &Path, format: GeoFormat, details: impl Into<String>) -> Os
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    use crate::geo::GeoFeatureId;
     use tempfile::tempdir;
 
     use super::*;
