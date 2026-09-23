@@ -507,10 +507,22 @@ fn process_way(
     sink: &mut dyn FeatureSink,
     report: &mut FilterReport,
 ) -> Result<()> {
+    let required_for_relation = required_way_ids.contains(&way.id);
+    let way_tags = compiled
+        .includes_type(ElementType::Way)
+        .then(|| normalize_tags(&way.tags));
+    let matches_way_tags = way_tags
+        .as_ref()
+        .is_some_and(|tags| compiled.matches_way_tags(tags));
+
+    if !matches_way_tags && !required_for_relation {
+        return Ok(());
+    }
+
     let mut coordinates = match coordinates_for_way(&way.nodes, node_index)? {
         Some(coordinates) => coordinates,
         None => {
-            if compiled.includes_type(ElementType::Way) {
+            if matches_way_tags {
                 report.ways_skipped_missing_nodes += 1;
                 warn!(
                     way_id = way.id.0,
@@ -521,20 +533,17 @@ fn process_way(
         }
     };
 
-    if compiled.includes_type(ElementType::Way) {
-        let tags = normalize_tags(&way.tags);
-        if compiled.matches_way(&tags, &coordinates) {
-            sink.write_feature(Feature {
-                id: way.id.0,
-                kind: ElementKind::Way,
-                tags,
-                geometry: way_geometry(&coordinates, way.is_closed(), compiled.geometry_mode),
-            })?;
-            report.objects_written += 1;
-        }
+    if matches_way_tags && compiled.matches_way_geometry(&coordinates) {
+        sink.write_feature(Feature {
+            id: way.id.0,
+            kind: ElementKind::Way,
+            tags: way_tags.expect("matching way has normalized tags"),
+            geometry: way_geometry(&coordinates, way.is_closed(), compiled.geometry_mode),
+        })?;
+        report.objects_written += 1;
     }
 
-    if required_way_ids.contains(&way.id) {
+    if required_for_relation {
         relation_way_geometries.insert(way.id, std::mem::take(&mut coordinates));
     }
 
@@ -580,14 +589,12 @@ fn coordinates_for_way(
     nodes: &[NodeId],
     node_index: &dyn NodeIndex,
 ) -> Result<Option<Vec<Coordinate>>> {
-    let mut coordinates = Vec::with_capacity(nodes.len());
-    for node_id in nodes {
-        let Some(coordinate) = node_index.get(*node_id)? else {
-            return Ok(None);
-        };
-        coordinates.push(coordinate.to_coordinate());
-    }
-    Ok(Some(coordinates))
+    Ok(node_index.get_batch(nodes)?.map(|coordinates| {
+        coordinates
+            .into_iter()
+            .map(StoredCoordinate::to_coordinate)
+            .collect()
+    }))
 }
 
 fn normalize_tags(tags: &Tags) -> NormalizedTags {
@@ -876,8 +883,15 @@ impl CompiledFilter {
     }
 
     pub fn matches_way(&self, tags: &NormalizedTags, coordinates: &[Coordinate]) -> bool {
+        self.matches_way_tags(tags) && self.matches_way_geometry(coordinates)
+    }
+
+    fn matches_way_tags(&self, tags: &NormalizedTags) -> bool {
+        self.types.contains(&ElementType::Way) && self.matches_tags(tags)
+    }
+
+    fn matches_way_geometry(&self, coordinates: &[Coordinate]) -> bool {
         self.types.contains(&ElementType::Way)
-            && self.matches_tags(tags)
             && self
                 .bbox
                 .map(|bbox| bbox.intersects_any(coordinates))
@@ -1009,6 +1023,7 @@ enum ConditionOperator {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     #[cfg(feature = "cli")]
     use std::io::Write;
 
@@ -1088,6 +1103,52 @@ mod tests {
             mode: crate::spec::IndexMode::Memory,
             memory_node_limit: 10,
             disk_dir: None,
+        }
+    }
+
+    struct CountingNodeIndex {
+        inner: MemoryNodeIndex,
+        single_gets: Cell<usize>,
+        batch_gets: Cell<usize>,
+    }
+
+    impl CountingNodeIndex {
+        fn with_nodes(entries: &[(NodeId, StoredCoordinate)]) -> Self {
+            let mut inner = MemoryNodeIndex::new();
+            inner.insert_batch(entries).unwrap();
+            Self {
+                inner,
+                single_gets: Cell::new(0),
+                batch_gets: Cell::new(0),
+            }
+        }
+    }
+
+    impl NodeIndex for CountingNodeIndex {
+        fn insert(&mut self, node_id: NodeId, coordinate: StoredCoordinate) -> Result<()> {
+            self.inner.insert(node_id, coordinate)
+        }
+
+        fn insert_batch(&mut self, entries: &[(NodeId, StoredCoordinate)]) -> Result<()> {
+            self.inner.insert_batch(entries)
+        }
+
+        fn get(&self, node_id: NodeId) -> Result<Option<StoredCoordinate>> {
+            self.single_gets.set(self.single_gets.get() + 1);
+            self.inner.get(node_id)
+        }
+
+        fn get_batch(&self, node_ids: &[NodeId]) -> Result<Option<Vec<StoredCoordinate>>> {
+            self.batch_gets.set(self.batch_gets.get() + 1);
+            self.inner.get_batch(node_ids)
+        }
+
+        fn backend(&self) -> IndexBackend {
+            self.inner.backend()
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
         }
     }
 
@@ -1225,6 +1286,97 @@ mod tests {
         writer.write_all(&header_len.to_be_bytes()).unwrap();
         writer.write_all(&header_bytes).unwrap();
         writer.write_all(&blob_bytes).unwrap();
+    }
+
+    #[test]
+    fn rejected_way_skips_geometry_lookup_entirely() {
+        let include = Some(IncludeRules {
+            any: vec![TagCondition {
+                key: "highway".to_owned(),
+                exists: None,
+                value: Some("residential".to_owned()),
+                values: None,
+                regex: None,
+                negate: false,
+            }],
+            all: Vec::new(),
+        });
+        let compiled = CompiledFilter::compile(&spec(vec![ElementType::Way], include)).unwrap();
+        let index = CountingNodeIndex::with_nodes(&[
+            (NodeId(1), StoredCoordinate::from_degrees(8.7, 48.9)),
+            (NodeId(2), StoredCoordinate::from_degrees(8.8, 49.0)),
+        ]);
+        let way = Way {
+            id: WayId(7),
+            tags: osm_tags(&[("highway", "service")]),
+            nodes: vec![NodeId(1), NodeId(2)],
+        };
+        let mut sink = VecFeatureSink::new();
+        let mut report = FilterReport::new(PathBuf::from("test.ndjson"));
+
+        process_way(
+            &way,
+            &compiled,
+            &index,
+            &HashSet::new(),
+            &mut HashMap::new(),
+            &mut sink,
+            &mut report,
+        )
+        .unwrap();
+
+        assert_eq!(index.single_gets.get(), 0);
+        assert_eq!(index.batch_gets.get(), 0);
+        assert!(sink.features.is_empty());
+    }
+
+    #[test]
+    fn required_relation_way_uses_one_batch_lookup_even_when_direct_filter_rejects_it() {
+        let include = Some(IncludeRules {
+            any: vec![TagCondition {
+                key: "highway".to_owned(),
+                exists: None,
+                value: Some("residential".to_owned()),
+                values: None,
+                regex: None,
+                negate: false,
+            }],
+            all: Vec::new(),
+        });
+        let compiled = CompiledFilter::compile(&spec(
+            vec![ElementType::Way, ElementType::Relation],
+            include,
+        ))
+        .unwrap();
+        let index = CountingNodeIndex::with_nodes(&[
+            (NodeId(1), StoredCoordinate::from_degrees(8.7, 48.9)),
+            (NodeId(2), StoredCoordinate::from_degrees(8.8, 49.0)),
+        ]);
+        let way = Way {
+            id: WayId(7),
+            tags: osm_tags(&[("highway", "service")]),
+            nodes: vec![NodeId(1), NodeId(2)],
+        };
+        let required = HashSet::from([WayId(7)]);
+        let mut geometries = HashMap::new();
+        let mut sink = VecFeatureSink::new();
+        let mut report = FilterReport::new(PathBuf::from("test.ndjson"));
+
+        process_way(
+            &way,
+            &compiled,
+            &index,
+            &required,
+            &mut geometries,
+            &mut sink,
+            &mut report,
+        )
+        .unwrap();
+
+        assert_eq!(index.single_gets.get(), 0);
+        assert_eq!(index.batch_gets.get(), 1);
+        assert_eq!(geometries.get(&WayId(7)).map(Vec::len), Some(2));
+        assert!(sink.features.is_empty());
     }
 
     #[test]
