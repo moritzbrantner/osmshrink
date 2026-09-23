@@ -562,19 +562,22 @@ fn geometry_has_z(geometry: &geojson::Geometry) -> bool {
     use geojson::GeometryValue;
 
     match &geometry.value {
-        GeometryValue::Point(position) => position.len() > 2,
-        GeometryValue::MultiPoint(positions) | GeometryValue::LineString(positions) => {
-            positions.iter().any(|position| position.len() > 2)
+        GeometryValue::Point { coordinates } => coordinates.len() > 2,
+        GeometryValue::MultiPoint { coordinates } | GeometryValue::LineString { coordinates } => {
+            coordinates.iter().any(|position| position.len() > 2)
         }
-        GeometryValue::MultiLineString(lines) | GeometryValue::Polygon(lines) => {
-            lines.iter().flatten().any(|position| position.len() > 2)
+        GeometryValue::MultiLineString { coordinates } | GeometryValue::Polygon { coordinates } => {
+            coordinates
+                .iter()
+                .flatten()
+                .any(|position| position.len() > 2)
         }
-        GeometryValue::MultiPolygon(polygons) => polygons
+        GeometryValue::MultiPolygon { coordinates } => coordinates
             .iter()
             .flatten()
             .flatten()
             .any(|position| position.len() > 2),
-        GeometryValue::GeometryCollection(geometries) => geometries.iter().any(geometry_has_z),
+        GeometryValue::GeometryCollection { geometries } => geometries.iter().any(geometry_has_z),
     }
 }
 
@@ -903,9 +906,9 @@ mod tests {
             features: vec![GeoFeature {
                 id: Some(GeoFeatureId::String("z-point".to_owned())),
                 properties: GeoMetadata::new(),
-                geometry: Some(geojson::Geometry::new(geojson::GeometryValue::Point(vec![
-                    8.7, 48.9, 123.4,
-                ]))),
+                geometry: Some(geojson::Geometry::new(geojson::GeometryValue::Point {
+                    coordinates: vec![8.7, 48.9, 123.4],
+                })),
                 bbox: None,
                 metadata: GeoMetadata::new(),
             }],
