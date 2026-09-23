@@ -1031,9 +1031,9 @@ impl CompiledCondition {
     }
 
     fn matches_osm(&self, tags: &Tags) -> bool {
-        let value = tags.iter().find_map(|(key, value)| {
-            (key.as_str() == self.key.as_str()).then_some(value.as_str())
-        });
+        let value = tags
+            .iter()
+            .find_map(|(key, value)| (key.as_str() == self.key.as_str()).then_some(value.as_str()));
         self.matches_value(value)
     }
 
