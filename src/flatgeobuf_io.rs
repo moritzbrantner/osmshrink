@@ -7,8 +7,8 @@ use flatgeobuf::{
     ColumnType, FallibleStreamingIterator, FeatureProperties, FgbCrs, FgbReader, FgbWriter,
     FgbWriterOptions, GeometryType,
 };
-use geozero::geojson::GeoJson;
-use geozero::{ColumnValue, PropertyProcessor, ToJson};
+use geozero::geojson::{GeoJson, GeoJsonWriter};
+use geozero::{ColumnValue, CoordDimensions, GeozeroGeometry, PropertyProcessor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -660,10 +660,16 @@ fn read_feature(
     feature: &flatgeobuf::FgbFeature,
     state_column: Option<&str>,
 ) -> Result<GeoFeature> {
-    let geometry_json = feature
-        .to_json()
+    // `ToJson::to_json` only emits XY; request XYZ so Z values survive the
+    // round trip. Geometries without Z still decode as 2D positions.
+    let mut geometry_json = Vec::new();
+    feature
+        .process_geom(&mut GeoJsonWriter::with_dims(
+            &mut geometry_json,
+            CoordDimensions::xyz(),
+        ))
         .map_err(|source| fgb_error(path, source.to_string()))?;
-    let geometry = serde_json::from_str::<geojson::Geometry>(&geometry_json)
+    let geometry = serde_json::from_slice::<geojson::Geometry>(&geometry_json)
         .map_err(|source| fgb_error(path, source.to_string()))?;
 
     let mut collector = PropertyCollector::default();

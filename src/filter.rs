@@ -901,10 +901,6 @@ impl CompiledFilter {
                 .unwrap_or(true)
     }
 
-    fn matches_relation_tags(&self, tags: &NormalizedTags) -> bool {
-        self.types.contains(&ElementType::Relation) && self.matches_tags(tags)
-    }
-
     fn matches_relation_osm_tags(&self, tags: &Tags) -> bool {
         self.types.contains(&ElementType::Relation) && self.matches_osm_tags(tags)
     }

@@ -1,9 +1,12 @@
+#[cfg(any(feature = "cli", feature = "flatgeobuf"))]
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 
-use crate::error::{OsmshrinkError, Result};
+#[cfg(any(feature = "cli", feature = "flatgeobuf"))]
+use crate::error::OsmshrinkError;
+use crate::error::Result;
 use crate::geometry::Geometry;
 use crate::model::Feature;
 
@@ -79,6 +82,7 @@ impl From<&Feature> for GeoFeature {
     }
 }
 
+#[cfg(any(feature = "cli", feature = "flatgeobuf"))]
 pub(crate) fn feature_from_geojson(feature: geojson::Feature) -> GeoFeature {
     GeoFeature {
         id: feature.id.map(GeoFeatureId::from),
@@ -89,6 +93,7 @@ pub(crate) fn feature_from_geojson(feature: geojson::Feature) -> GeoFeature {
     }
 }
 
+#[cfg(any(feature = "cli", feature = "flatgeobuf"))]
 pub(crate) fn parse_ndjson_feature(
     path: &Path,
     line_number: usize,
