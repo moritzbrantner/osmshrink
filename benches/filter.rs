@@ -24,13 +24,15 @@ fn bench_filter_pbf(c: &mut Criterion) {
     let input = fixture_dir.path().join("synthetic.osm.pbf");
     write_synthetic_extract(&input).expect("write synthetic PBF fixture");
 
-    let spec = way_filter_spec();
+    let spec = way_filter_spec("residential");
+    let rejected_spec = way_filter_spec("trunk");
     let index_options = IndexOptions {
         mode: IndexMode::Memory,
         memory_node_limit: NODE_COUNT + 1,
         disk_dir: None,
     };
     let output = fixture_dir.path().join("ways.ndjson");
+    let rejected_output = fixture_dir.path().join("rejected.ndjson");
 
     let mut group = c.benchmark_group("filter_pbf");
     group.sample_size(10);
@@ -56,10 +58,28 @@ fn bench_filter_pbf(c: &mut Criterion) {
         );
     });
 
+    group.bench_function("ways_rejected_before_geometry", |b| {
+        b.iter_batched(
+            || FilterRunOptions {
+                input: input.clone(),
+                output: rejected_output.clone(),
+                spec: rejected_spec.clone(),
+                format_override: None,
+                index_options: index_options.clone(),
+            },
+            |options| {
+                let report = filter_pbf(options).expect("benchmark filter run succeeds");
+                assert_eq!(report.objects_written, 0);
+                black_box(report);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     group.finish();
 }
 
-fn way_filter_spec() -> FilterSpec {
+fn way_filter_spec(highway: &str) -> FilterSpec {
     FilterSpec {
         source: None,
         filter: FilterRules {
@@ -69,7 +89,7 @@ fn way_filter_spec() -> FilterSpec {
                 any: vec![TagCondition {
                     key: "highway".to_owned(),
                     exists: None,
-                    value: Some("residential".to_owned()),
+                    value: Some(highway.to_owned()),
                     values: None,
                     regex: None,
                     negate: false,

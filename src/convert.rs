@@ -12,7 +12,7 @@ use crate::flatgeobuf_io::{
     read_flatgeobuf_dataset, stream_flatgeobuf_to_ndjson, stream_ndjson_to_flatgeobuf,
     write_flatgeobuf_dataset,
 };
-use crate::geo::{GeoDataset, GeoFeature, GeoFeatureId, GeoMetadata};
+use crate::geo::{GeoDataset, GeoFeature, GeoMetadata, feature_from_geojson, parse_ndjson_feature};
 use crate::model::Feature;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
@@ -114,12 +114,14 @@ pub struct ConvertOptions {
 }
 
 pub fn convert_path(options: ConvertOptions) -> Result<ConversionReport> {
-    let input_format = options
-        .input_format
-        .unwrap_or(GeoFormat::from_path(&options.input)?);
-    let output_format = options
-        .output_format
-        .unwrap_or(GeoFormat::from_path(&options.output)?);
+    let input_format = match options.input_format {
+        Some(format) => format,
+        None => GeoFormat::from_path(&options.input)?,
+    };
+    let output_format = match options.output_format {
+        Some(format) => format,
+        None => GeoFormat::from_path(&options.output)?,
+    };
 
     if input_format == GeoFormat::Ndjson && output_format == GeoFormat::Flatgeobuf {
         let features = stream_ndjson_to_flatgeobuf(&options.input, &options.output)?;
@@ -331,28 +333,6 @@ fn read_ndjson(path: &Path) -> Result<GeoDataset> {
     })
 }
 
-pub(crate) fn parse_ndjson_feature(
-    path: &Path,
-    line_number: usize,
-    line: &str,
-) -> Result<GeoFeature> {
-    if let Ok(feature) = serde_json::from_str::<geojson::Feature>(line) {
-        return Ok(feature_from_geojson(feature));
-    }
-    if let Ok(feature) = serde_json::from_str::<Feature>(line) {
-        return Ok(GeoFeature::from_osm(&feature));
-    }
-    if let Ok(feature) = serde_json::from_str::<GeoFeature>(line) {
-        return Ok(feature);
-    }
-
-    Err(parse_error(
-        path,
-        GeoFormat::Ndjson,
-        format!("line {line_number} is not a supported feature record"),
-    ))
-}
-
 fn dataset_from_geojson(document: geojson::GeoJson) -> GeoDataset {
     match document {
         geojson::GeoJson::FeatureCollection(collection) => {
@@ -383,16 +363,6 @@ fn dataset_from_geojson(document: geojson::GeoJson) -> GeoDataset {
             }],
             ..GeoDataset::default()
         },
-    }
-}
-
-pub(crate) fn feature_from_geojson(feature: geojson::Feature) -> GeoFeature {
-    GeoFeature {
-        id: feature.id.map(GeoFeatureId::from),
-        properties: feature.properties.unwrap_or_default(),
-        geometry: feature.geometry,
-        bbox: feature.bbox,
-        metadata: feature.foreign_members.unwrap_or_default(),
     }
 }
 
@@ -532,6 +502,8 @@ fn parse_error(path: &Path, format: GeoFormat, details: impl Into<String>) -> Os
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    use crate::geo::GeoFeatureId;
     use tempfile::tempdir;
 
     use super::*;
@@ -546,6 +518,36 @@ mod tests {
             GeoFormat::from_path(Path::new("map.flatgeobuf")).unwrap(),
             GeoFormat::Flatgeobuf
         );
+    }
+
+    #[test]
+    fn explicit_formats_do_not_require_recognized_extensions() {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("source.data");
+        let output = dir.path().join("result.data");
+        fs::write(
+            &input,
+            r#"{"type":"FeatureCollection","features":[{"type":"Feature","id":"a","properties":{"rank":3},"geometry":{"type":"Point","coordinates":[8.7,48.9]}}]}"#,
+        )
+        .unwrap();
+
+        let report = convert_path(ConvertOptions {
+            input,
+            output: output.clone(),
+            input_format: Some(GeoFormat::Geojson),
+            output_format: Some(GeoFormat::Json),
+        })
+        .unwrap();
+
+        assert_eq!(report.features_read, 1);
+        assert_eq!(report.features_written, 1);
+        let dataset: GeoDataset =
+            serde_json::from_str(&fs::read_to_string(output).unwrap()).unwrap();
+        assert_eq!(
+            dataset.features[0].id,
+            Some(GeoFeatureId::String("a".to_owned()))
+        );
+        assert_eq!(dataset.features[0].properties["rank"], 3);
     }
 
     #[test]

@@ -57,3 +57,7 @@ protobuf = "2"
 [[bench]]
 name = "filter"
 harness = false
+
+[[bench]]
+name = "node_index"
+harness = false

@@ -7,14 +7,13 @@ use flatgeobuf::{
     ColumnType, FallibleStreamingIterator, FeatureProperties, FgbCrs, FgbReader, FgbWriter,
     FgbWriterOptions, GeometryType,
 };
-use geozero::geojson::GeoJson;
-use geozero::{ColumnValue, PropertyProcessor, ToJson};
+use geozero::geojson::{GeoJson, GeoJsonWriter};
+use geozero::{ColumnValue, CoordDimensions, GeozeroGeometry, PropertyProcessor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::convert::parse_ndjson_feature;
 use crate::error::{OsmshrinkError, Result};
-use crate::geo::{GeoDataset, GeoFeature, GeoFeatureId, GeoMetadata};
+use crate::geo::{GeoDataset, GeoFeature, GeoFeatureId, GeoMetadata, parse_ndjson_feature};
 
 const FGB_METADATA_VERSION: u8 = 1;
 const FGB_METADATA_KIND: &str = "osmshrink.flatgeobuf";
@@ -202,7 +201,14 @@ pub fn write_flatgeobuf_dataset(
         .crs
         .as_deref()
         .or(assume_wgs84.then_some("EPSG:4326"));
-    let mut writer = create_writer(path, &schema, effective_crs, &metadata)?;
+    let mut dimensions = ZDimensions::default();
+    dataset
+        .features
+        .iter()
+        .filter_map(|feature| feature.geometry.as_ref())
+        .for_each(|geometry| dimensions.observe(geometry));
+    let has_z = dimensions.has_z();
+    let mut writer = create_writer(path, &schema, effective_crs, &metadata, has_z)?;
 
     for feature in &dataset.features {
         add_feature(path, &mut writer, &schema, feature)?;
@@ -212,14 +218,14 @@ pub fn write_flatgeobuf_dataset(
 }
 
 pub fn stream_ndjson_to_flatgeobuf(path: &Path, output: &Path) -> Result<usize> {
-    let (schema, feature_count) = infer_ndjson_schema(path)?;
+    let (schema, feature_count, has_z) = infer_ndjson_schema(path)?;
     let dataset = GeoDataset::default();
     let metadata = serde_json::to_string(&HeaderState::new(
         &dataset,
         schema.feature_state_column.clone(),
     ))
     .map_err(|source| fgb_error(output, source.to_string()))?;
-    let mut writer = create_writer(output, &schema, None, &metadata)?;
+    let mut writer = create_writer(output, &schema, None, &metadata, has_z)?;
 
     let file = File::open(path).map_err(|source| OsmshrinkError::ReadFile {
         path: path.to_path_buf(),
@@ -243,6 +249,8 @@ pub fn stream_ndjson_to_flatgeobuf(path: &Path, output: &Path) -> Result<usize> 
 }
 
 pub fn stream_flatgeobuf_to_ndjson(path: &Path, output: &Path) -> Result<FlatGeobufStreamReport> {
+    reject_same_file(path, output)?;
+
     if let Some(parent) = output
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -303,13 +311,14 @@ pub fn stream_flatgeobuf_to_ndjson(path: &Path, output: &Path) -> Result<FlatGeo
     })
 }
 
-fn infer_ndjson_schema(path: &Path) -> Result<(PropertySchema, usize)> {
+fn infer_ndjson_schema(path: &Path) -> Result<(PropertySchema, usize, bool)> {
     let file = File::open(path).map_err(|source| OsmshrinkError::ReadFile {
         path: path.to_path_buf(),
         source,
     })?;
     let mut columns = BTreeMap::<String, Option<PropertyKind>>::new();
     let mut count = 0;
+    let mut dimensions = ZDimensions::default();
 
     for (line_index, line) in BufReader::new(file).lines().enumerate() {
         let line = line.map_err(|source| OsmshrinkError::ReadFile {
@@ -322,10 +331,17 @@ fn infer_ndjson_schema(path: &Path) -> Result<(PropertySchema, usize)> {
         }
         let feature = parse_ndjson_feature(path, line_index + 1, line)?;
         observe_feature(&mut columns, &feature);
+        if let Some(geometry) = feature.geometry.as_ref() {
+            dimensions.observe(geometry);
+        }
         count += 1;
     }
 
-    Ok((PropertySchema::from_columns(columns), count))
+    Ok((
+        PropertySchema::from_columns(columns),
+        count,
+        dimensions.has_z(),
+    ))
 }
 
 fn observe_feature(columns: &mut BTreeMap<String, Option<PropertyKind>>, feature: &GeoFeature) {
@@ -371,6 +387,7 @@ fn create_writer<'a>(
     schema: &PropertySchema,
     crs: Option<&'a str>,
     metadata: &'a str,
+    has_z: bool,
 ) -> Result<FgbWriter<'a>> {
     let name = path
         .file_stem()
@@ -381,6 +398,7 @@ fn create_writer<'a>(
         detect_type: false,
         promote_to_multi: false,
         crs: fgb_crs(crs),
+        has_z,
         metadata: Some(metadata),
         ..Default::default()
     };
@@ -538,9 +556,94 @@ fn finish_writer(path: &Path, writer: FgbWriter<'_>) -> Result<()> {
         path: path.to_path_buf(),
         source,
     })?;
+    let mut output = BufWriter::new(file);
     writer
-        .write(BufWriter::new(file))
-        .map_err(|source| fgb_error(path, source.to_string()))
+        .write(&mut output)
+        .map_err(|source| fgb_error(path, source.to_string()))?;
+    output.flush().map_err(|source| OsmshrinkError::WriteFile {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Tracks whether every coordinate seen so far carries a Z value.
+///
+/// FlatGeobuf stores Z per layer, so the layer may only be declared XYZ when
+/// every position provides Z. Mixed-dimensional input is written as XY to keep
+/// the Z array aligned with the XY array.
+#[derive(Debug, Default, Clone, Copy)]
+struct ZDimensions {
+    saw_position: bool,
+    missing_z: bool,
+}
+
+impl ZDimensions {
+    fn observe(&mut self, geometry: &geojson::Geometry) {
+        use geojson::GeometryValue;
+
+        match &geometry.value {
+            GeometryValue::Point { coordinates } => self.observe_position(coordinates),
+            GeometryValue::MultiPoint { coordinates }
+            | GeometryValue::LineString { coordinates } => {
+                coordinates.iter().for_each(|p| self.observe_position(p));
+            }
+            GeometryValue::MultiLineString { coordinates }
+            | GeometryValue::Polygon { coordinates } => coordinates
+                .iter()
+                .flatten()
+                .for_each(|p| self.observe_position(p)),
+            GeometryValue::MultiPolygon { coordinates } => coordinates
+                .iter()
+                .flatten()
+                .flatten()
+                .for_each(|p| self.observe_position(p)),
+            GeometryValue::GeometryCollection { geometries } => {
+                geometries.iter().for_each(|g| self.observe(g));
+            }
+        }
+    }
+
+    fn observe_position(&mut self, position: &geojson::Position) {
+        self.saw_position = true;
+        self.missing_z |= position.len() < 3;
+    }
+
+    fn has_z(self) -> bool {
+        self.saw_position && !self.missing_z
+    }
+}
+
+fn reject_same_file(input: &Path, output: &Path) -> Result<()> {
+    if !output.exists() {
+        return Ok(());
+    }
+
+    let same =
+        paths_refer_to_same_file(input, output).map_err(|source| OsmshrinkError::ReadFile {
+            path: input.to_path_buf(),
+            source,
+        })?;
+    if same {
+        return Err(fgb_error(
+            output,
+            "input and output refer to the same file; refusing to truncate unread input",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let left = fs::metadata(left)?;
+    let right = fs::metadata(right)?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+#[cfg(not(unix))]
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> std::io::Result<bool> {
+    Ok(fs::canonicalize(left)? == fs::canonicalize(right)?)
 }
 
 #[derive(Default)]
@@ -589,10 +692,16 @@ fn read_feature(
     feature: &flatgeobuf::FgbFeature,
     state_column: Option<&str>,
 ) -> Result<GeoFeature> {
-    let geometry_json = feature
-        .to_json()
+    // `ToJson::to_json` only emits XY; request XYZ so Z values survive the
+    // round trip. Geometries without Z still decode as 2D positions.
+    let mut geometry_json = Vec::new();
+    feature
+        .process_geom(&mut GeoJsonWriter::with_dims(
+            &mut geometry_json,
+            CoordDimensions::xyz(),
+        ))
         .map_err(|source| fgb_error(path, source.to_string()))?;
-    let geometry = serde_json::from_str::<geojson::Geometry>(&geometry_json)
+    let geometry = serde_json::from_slice::<geojson::Geometry>(&geometry_json)
         .map_err(|source| fgb_error(path, source.to_string()))?;
 
     let mut collector = PropertyCollector::default();
@@ -825,6 +934,105 @@ mod tests {
         assert_eq!(roundtrip.id, feature.id);
         assert_eq!(roundtrip.properties, feature.properties);
         assert_eq!(roundtrip.metadata, feature.metadata);
+    }
+
+    #[test]
+    fn round_trips_z_coordinates() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("z.fgb");
+        let dataset = GeoDataset {
+            features: vec![GeoFeature {
+                id: Some(GeoFeatureId::String("z-point".to_owned())),
+                properties: GeoMetadata::new(),
+                geometry: Some(geojson::Geometry::new(geojson::GeometryValue::Point {
+                    coordinates: vec![8.7, 48.9, 123.4].into(),
+                })),
+                bbox: None,
+                metadata: GeoMetadata::new(),
+            }],
+            ..GeoDataset::default()
+        };
+
+        write_flatgeobuf_dataset(&path, &dataset, false).unwrap();
+        let roundtrip = read_flatgeobuf_dataset(&path).unwrap();
+
+        assert_eq!(roundtrip.features[0].geometry, dataset.features[0].geometry);
+    }
+
+    #[test]
+    fn mixed_z_coordinates_are_written_as_xy() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mixed.fgb");
+        let feature = |id: &str, geometry: geojson::GeometryValue| GeoFeature {
+            id: Some(GeoFeatureId::String(id.to_owned())),
+            properties: GeoMetadata::new(),
+            geometry: Some(geojson::Geometry::new(geometry)),
+            bbox: None,
+            metadata: GeoMetadata::new(),
+        };
+        let dataset = GeoDataset {
+            features: vec![
+                feature(
+                    "mixed-line",
+                    geojson::GeometryValue::LineString {
+                        coordinates: vec![vec![8.0, 48.0].into(), vec![8.1, 48.1, 12.0].into()],
+                    },
+                ),
+                feature(
+                    "z-point",
+                    geojson::GeometryValue::Point {
+                        coordinates: vec![8.7, 48.9, 123.4].into(),
+                    },
+                ),
+            ],
+            ..GeoDataset::default()
+        };
+
+        write_flatgeobuf_dataset(&path, &dataset, false).unwrap();
+        let roundtrip = read_flatgeobuf_dataset(&path).unwrap();
+        let geometry_of = |id: &str| {
+            roundtrip
+                .features
+                .iter()
+                .find(|feature| feature.id == Some(GeoFeatureId::String(id.to_owned())))
+                .and_then(|feature| feature.geometry.clone())
+        };
+
+        assert_eq!(
+            geometry_of("mixed-line"),
+            Some(geojson::Geometry::new(geojson::GeometryValue::LineString {
+                coordinates: vec![vec![8.0, 48.0].into(), vec![8.1, 48.1].into()],
+            }))
+        );
+        assert_eq!(
+            geometry_of("z-point"),
+            Some(geojson::Geometry::new(geojson::GeometryValue::Point {
+                coordinates: vec![8.7, 48.9].into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn streaming_to_same_file_is_rejected_without_modifying_input() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("same.fgb");
+        let dataset = fixture();
+        write_flatgeobuf_dataset(&path, &dataset, false).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let error = stream_flatgeobuf_to_ndjson(&path, &path).unwrap_err();
+
+        assert!(error.to_string().contains("same file"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn final_output_flush_errors_are_reported() {
+        let dataset = GeoDataset::default();
+        let error = write_flatgeobuf_dataset(Path::new("/dev/full"), &dataset, false).unwrap_err();
+
+        assert!(matches!(error, OsmshrinkError::WriteFile { .. }));
     }
 
     #[test]
