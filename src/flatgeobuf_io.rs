@@ -201,11 +201,13 @@ pub fn write_flatgeobuf_dataset(
         .crs
         .as_deref()
         .or(assume_wgs84.then_some("EPSG:4326"));
-    let has_z = dataset
+    let mut dimensions = ZDimensions::default();
+    dataset
         .features
         .iter()
         .filter_map(|feature| feature.geometry.as_ref())
-        .any(geometry_has_z);
+        .for_each(|geometry| dimensions.observe(geometry));
+    let has_z = dimensions.has_z();
     let mut writer = create_writer(path, &schema, effective_crs, &metadata, has_z)?;
 
     for feature in &dataset.features {
@@ -316,7 +318,7 @@ fn infer_ndjson_schema(path: &Path) -> Result<(PropertySchema, usize, bool)> {
     })?;
     let mut columns = BTreeMap::<String, Option<PropertyKind>>::new();
     let mut count = 0;
-    let mut has_z = false;
+    let mut dimensions = ZDimensions::default();
 
     for (line_index, line) in BufReader::new(file).lines().enumerate() {
         let line = line.map_err(|source| OsmshrinkError::ReadFile {
@@ -329,11 +331,17 @@ fn infer_ndjson_schema(path: &Path) -> Result<(PropertySchema, usize, bool)> {
         }
         let feature = parse_ndjson_feature(path, line_index + 1, line)?;
         observe_feature(&mut columns, &feature);
-        has_z |= feature.geometry.as_ref().is_some_and(geometry_has_z);
+        if let Some(geometry) = feature.geometry.as_ref() {
+            dimensions.observe(geometry);
+        }
         count += 1;
     }
 
-    Ok((PropertySchema::from_columns(columns), count, has_z))
+    Ok((
+        PropertySchema::from_columns(columns),
+        count,
+        dimensions.has_z(),
+    ))
 }
 
 fn observe_feature(columns: &mut BTreeMap<String, Option<PropertyKind>>, feature: &GeoFeature) {
@@ -558,26 +566,50 @@ fn finish_writer(path: &Path, writer: FgbWriter<'_>) -> Result<()> {
     })
 }
 
-fn geometry_has_z(geometry: &geojson::Geometry) -> bool {
-    use geojson::GeometryValue;
+/// Tracks whether every coordinate seen so far carries a Z value.
+///
+/// FlatGeobuf stores Z per layer, so the layer may only be declared XYZ when
+/// every position provides Z. Mixed-dimensional input is written as XY to keep
+/// the Z array aligned with the XY array.
+#[derive(Debug, Default, Clone, Copy)]
+struct ZDimensions {
+    saw_position: bool,
+    missing_z: bool,
+}
 
-    match &geometry.value {
-        GeometryValue::Point { coordinates } => coordinates.len() > 2,
-        GeometryValue::MultiPoint { coordinates } | GeometryValue::LineString { coordinates } => {
-            coordinates.iter().any(|position| position.len() > 2)
-        }
-        GeometryValue::MultiLineString { coordinates } | GeometryValue::Polygon { coordinates } => {
-            coordinates
+impl ZDimensions {
+    fn observe(&mut self, geometry: &geojson::Geometry) {
+        use geojson::GeometryValue;
+
+        match &geometry.value {
+            GeometryValue::Point { coordinates } => self.observe_position(coordinates),
+            GeometryValue::MultiPoint { coordinates }
+            | GeometryValue::LineString { coordinates } => {
+                coordinates.iter().for_each(|p| self.observe_position(p));
+            }
+            GeometryValue::MultiLineString { coordinates }
+            | GeometryValue::Polygon { coordinates } => coordinates
                 .iter()
                 .flatten()
-                .any(|position| position.len() > 2)
+                .for_each(|p| self.observe_position(p)),
+            GeometryValue::MultiPolygon { coordinates } => coordinates
+                .iter()
+                .flatten()
+                .flatten()
+                .for_each(|p| self.observe_position(p)),
+            GeometryValue::GeometryCollection { geometries } => {
+                geometries.iter().for_each(|g| self.observe(g));
+            }
         }
-        GeometryValue::MultiPolygon { coordinates } => coordinates
-            .iter()
-            .flatten()
-            .flatten()
-            .any(|position| position.len() > 2),
-        GeometryValue::GeometryCollection { geometries } => geometries.iter().any(geometry_has_z),
+    }
+
+    fn observe_position(&mut self, position: &geojson::Position) {
+        self.saw_position = true;
+        self.missing_z |= position.len() < 3;
+    }
+
+    fn has_z(self) -> bool {
+        self.saw_position && !self.missing_z
     }
 }
 
@@ -925,6 +957,59 @@ mod tests {
         let roundtrip = read_flatgeobuf_dataset(&path).unwrap();
 
         assert_eq!(roundtrip.features[0].geometry, dataset.features[0].geometry);
+    }
+
+    #[test]
+    fn mixed_z_coordinates_are_written_as_xy() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mixed.fgb");
+        let feature = |id: &str, geometry: geojson::GeometryValue| GeoFeature {
+            id: Some(GeoFeatureId::String(id.to_owned())),
+            properties: GeoMetadata::new(),
+            geometry: Some(geojson::Geometry::new(geometry)),
+            bbox: None,
+            metadata: GeoMetadata::new(),
+        };
+        let dataset = GeoDataset {
+            features: vec![
+                feature(
+                    "mixed-line",
+                    geojson::GeometryValue::LineString {
+                        coordinates: vec![vec![8.0, 48.0].into(), vec![8.1, 48.1, 12.0].into()],
+                    },
+                ),
+                feature(
+                    "z-point",
+                    geojson::GeometryValue::Point {
+                        coordinates: vec![8.7, 48.9, 123.4].into(),
+                    },
+                ),
+            ],
+            ..GeoDataset::default()
+        };
+
+        write_flatgeobuf_dataset(&path, &dataset, false).unwrap();
+        let roundtrip = read_flatgeobuf_dataset(&path).unwrap();
+        let geometry_of = |id: &str| {
+            roundtrip
+                .features
+                .iter()
+                .find(|feature| feature.id == Some(GeoFeatureId::String(id.to_owned())))
+                .and_then(|feature| feature.geometry.clone())
+        };
+
+        assert_eq!(
+            geometry_of("mixed-line"),
+            Some(geojson::Geometry::new(geojson::GeometryValue::LineString {
+                coordinates: vec![vec![8.0, 48.0].into(), vec![8.1, 48.1].into()],
+            }))
+        );
+        assert_eq!(
+            geometry_of("z-point"),
+            Some(geojson::Geometry::new(geojson::GeometryValue::Point {
+                coordinates: vec![8.7, 48.9].into(),
+            }))
+        );
     }
 
     #[test]
