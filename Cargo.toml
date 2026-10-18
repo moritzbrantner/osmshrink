@@ -51,8 +51,8 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [dev-dependencies]
-criterion = "0.5"
-protobuf = "2"
+criterion = "=0.5.1"
+protobuf = "=2.28.0"
 
 [[bench]]
 name = "filter"
