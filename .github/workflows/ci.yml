@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   rust:
-    name: Rust validation
+    name: merge-ready
     runs-on: ubuntu-latest
 
     steps:
