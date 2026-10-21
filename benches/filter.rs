@@ -106,7 +106,7 @@ fn way_filter_spec(highway: &str) -> FilterSpec {
 fn write_synthetic_extract(path: &Path) -> Result<(), Box<dyn Error>> {
     let mut string_table = osmformat::StringTable::new();
     for value in ["", "highway", "residential", "name", "Synthetic Road"] {
-        string_table.mut_s().push(value.as_bytes().to_vec());
+        string_table.s.push(value.as_bytes().to_vec());
     }
 
     let mut dense_nodes = osmformat::DenseNodes::new();
@@ -130,7 +130,7 @@ fn write_synthetic_extract(path: &Path) -> Result<(), Box<dyn Error>> {
     }
 
     let mut group = osmformat::PrimitiveGroup::new();
-    group.set_dense(dense_nodes);
+    group.dense = protobuf::MessageField::some(dense_nodes);
     for index in 0..WAY_COUNT {
         let first_node_id = (index * NODES_PER_WAY) as i64 + 1;
         let mut way = osmformat::Way::new();
@@ -138,12 +138,12 @@ fn write_synthetic_extract(path: &Path) -> Result<(), Box<dyn Error>> {
         way.keys = vec![1, 3];
         way.vals = vec![2, 4];
         way.refs = vec![first_node_id, 1, 1, 1];
-        group.mut_ways().push(way);
+        group.ways.push(way);
     }
 
     let mut block = osmformat::PrimitiveBlock::new();
-    block.set_stringtable(string_table);
-    block.mut_primitivegroup().push(group);
+    block.stringtable = protobuf::MessageField::some(string_table);
+    block.primitivegroup.push(group);
 
     let mut file = File::create(path)?;
     write_raw_blob(&mut file, "OSMData", block.write_to_bytes()?)?;
@@ -160,7 +160,7 @@ fn write_raw_blob(
     let blob_bytes = blob.write_to_bytes()?;
 
     let mut header = fileformat::BlobHeader::new();
-    header.set_field_type(field_type.to_owned());
+    header.set_type(field_type.to_owned());
     header.set_datasize(blob_bytes.len().try_into()?);
     let header_bytes = header.write_to_bytes()?;
 

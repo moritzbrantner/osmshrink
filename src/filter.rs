@@ -1267,7 +1267,7 @@ mod tests {
             "name",
             "Synthetic Road",
         ] {
-            string_table.mut_s().push(value.as_bytes().to_vec());
+            string_table.s.push(value.as_bytes().to_vec());
         }
 
         let mut dense_nodes = osmformat::DenseNodes::new();
@@ -1295,12 +1295,12 @@ mod tests {
         way.refs = vec![1, 1, 1];
 
         let mut group = osmformat::PrimitiveGroup::new();
-        group.set_dense(dense_nodes);
-        group.mut_ways().push(way);
+        group.dense = protobuf::MessageField::some(dense_nodes);
+        group.ways.push(way);
 
         let mut block = osmformat::PrimitiveBlock::new();
-        block.set_stringtable(string_table);
-        block.mut_primitivegroup().push(group);
+        block.stringtable = protobuf::MessageField::some(string_table);
+        block.primitivegroup.push(group);
 
         let mut bytes = Vec::new();
         write_raw_blob(&mut bytes, "OSMData", block.write_to_bytes().unwrap());
@@ -1314,7 +1314,7 @@ mod tests {
         let blob_bytes = blob.write_to_bytes().unwrap();
 
         let mut header = fileformat::BlobHeader::new();
-        header.set_field_type(field_type.to_owned());
+        header.set_type(field_type.to_owned());
         header.set_datasize(blob_bytes.len().try_into().unwrap());
         let header_bytes = header.write_to_bytes().unwrap();
 
