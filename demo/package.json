@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "packageManager": "bun@1.3.13",
+  "packageManager": "bun@1.4.3",
   "scripts": {
     "dev": "bun run dev:wasm",
     "build:wasm": "wasm-pack build ../wasm --target web --out-dir ../demo/src/wasm/pkg --release",
