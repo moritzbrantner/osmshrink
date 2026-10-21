@@ -12,11 +12,11 @@ flatgeobuf = { version = "6.0.1", default-features = false, optional = true }
 futures-util = { version = "0.3", optional = true }
 geojson = "1"
 geozero = { version = "0.15.1", default-features = false, features = ["with-geojson"], optional = true }
-indicatif = { version = "0.17", optional = true }
-osmpbfreader = "0.16"
+indicatif = { version = "0.18", optional = true }
+osmpbfreader = "0.19"
 redb = { version = "4.1", optional = true }
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-tls", "stream"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = { version = "0.9", optional = true }
@@ -51,7 +51,7 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [dev-dependencies]
-criterion = "=0.5.1"
+criterion = "=0.8.2"
 protobuf = "=2.28.0"
 
 [[bench]]
