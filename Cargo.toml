@@ -52,7 +52,7 @@ required-features = ["cli"]
 
 [dev-dependencies]
 criterion = "=0.8.2"
-protobuf = "3"
+protobuf = "=3.7.2"
 
 [[bench]]
 name = "filter"
