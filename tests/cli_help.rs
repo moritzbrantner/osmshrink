@@ -75,5 +75,5 @@ fn run_help_uses_distinct_source_and_spec_short_flags() {
 
     assert!(help.contains("-s, --source <SOURCE>"));
     assert!(help.contains("-f, --spec <FILE>"));
-    assert!(help.contains("[aliases: --filter-file]"));
+    assert!(help.contains("[alias: --filter-file]"));
 }
