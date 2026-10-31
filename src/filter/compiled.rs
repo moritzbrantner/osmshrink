@@ -8,9 +8,39 @@ use crate::geometry::{BBox, Coordinate, Geometry};
 use crate::model::Tags as NormalizedTags;
 use crate::spec::{ElementType, FilterSpec, GeometryMode, IncludeRules, OutputField, TagCondition};
 
+/// Checked for every element, so a plain lookup rather than a hashed set.
+#[derive(Debug, Clone, Copy, Default)]
+struct ElementTypeSet {
+    node: bool,
+    way: bool,
+    relation: bool,
+}
+
+impl ElementTypeSet {
+    fn from_types(types: &[ElementType]) -> Self {
+        let mut set = Self::default();
+        for element_type in types {
+            match element_type {
+                ElementType::Node => set.node = true,
+                ElementType::Way => set.way = true,
+                ElementType::Relation => set.relation = true,
+            }
+        }
+        set
+    }
+
+    fn contains(self, element_type: ElementType) -> bool {
+        match element_type {
+            ElementType::Node => self.node,
+            ElementType::Way => self.way,
+            ElementType::Relation => self.relation,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CompiledFilter {
-    types: HashSet<ElementType>,
+    types: ElementTypeSet,
     bbox: Option<BBox>,
     include_any: Vec<CompiledCondition>,
     include_all: Vec<CompiledCondition>,
@@ -22,13 +52,12 @@ pub struct CompiledFilter {
 impl CompiledFilter {
     pub fn compile(spec: &FilterSpec) -> Result<Self> {
         spec.validate()?;
-        let types: HashSet<ElementType> = spec
-            .filter
-            .types
-            .clone()
-            .unwrap_or_else(|| vec![ElementType::Node, ElementType::Way])
-            .into_iter()
-            .collect();
+        let types = ElementTypeSet::from_types(
+            spec.filter
+                .types
+                .as_deref()
+                .unwrap_or(&[ElementType::Node, ElementType::Way]),
+        );
 
         let IncludeRules { any, all } = spec.filter.include.clone().unwrap_or_default();
 
@@ -44,21 +73,21 @@ impl CompiledFilter {
     }
 
     pub fn includes_type(&self, element_type: ElementType) -> bool {
-        self.types.contains(&element_type)
+        self.types.contains(element_type)
     }
 
     pub fn matches_node(&self, tags: &NormalizedTags, coordinate: Coordinate) -> bool {
-        self.types.contains(&ElementType::Node)
+        self.types.contains(ElementType::Node)
             && self.matches_node_tags(tags)
             && self.matches_node_bbox(coordinate)
     }
 
     fn matches_node_tags(&self, tags: &NormalizedTags) -> bool {
-        self.types.contains(&ElementType::Node) && self.matches_tags(tags)
+        self.types.contains(ElementType::Node) && self.matches_tags(tags)
     }
 
     pub(super) fn matches_node_osm_tags(&self, tags: &Tags) -> bool {
-        self.types.contains(&ElementType::Node) && self.matches_osm_tags(tags)
+        self.types.contains(ElementType::Node) && self.matches_osm_tags(tags)
     }
 
     pub(super) fn matches_node_bbox(&self, coordinate: Coordinate) -> bool {
@@ -72,15 +101,15 @@ impl CompiledFilter {
     }
 
     fn matches_way_tags(&self, tags: &NormalizedTags) -> bool {
-        self.types.contains(&ElementType::Way) && self.matches_tags(tags)
+        self.types.contains(ElementType::Way) && self.matches_tags(tags)
     }
 
     pub(super) fn matches_way_osm_tags(&self, tags: &Tags) -> bool {
-        self.types.contains(&ElementType::Way) && self.matches_osm_tags(tags)
+        self.types.contains(ElementType::Way) && self.matches_osm_tags(tags)
     }
 
     pub(super) fn matches_way_geometry(&self, coordinates: &[Coordinate]) -> bool {
-        self.types.contains(&ElementType::Way)
+        self.types.contains(ElementType::Way)
             && self
                 .bbox
                 .map(|bbox| bbox.intersects_any(coordinates))
@@ -88,11 +117,11 @@ impl CompiledFilter {
     }
 
     pub(super) fn matches_relation_osm_tags(&self, tags: &Tags) -> bool {
-        self.types.contains(&ElementType::Relation) && self.matches_osm_tags(tags)
+        self.types.contains(ElementType::Relation) && self.matches_osm_tags(tags)
     }
 
     pub(super) fn matches_relation_geometry(&self, geometry: &Geometry) -> bool {
-        self.types.contains(&ElementType::Relation)
+        self.types.contains(ElementType::Relation)
             && self
                 .bbox
                 .map(|bbox| geometry_intersects_bbox(geometry, bbox))

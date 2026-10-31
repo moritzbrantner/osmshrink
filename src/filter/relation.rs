@@ -53,8 +53,8 @@ pub(super) fn assemble_relation(
             return RelationAssemblyResult::MissingMembers;
         };
         match member.role {
-            RelationMemberRole::Outer => outer_segments.push(coordinates.clone()),
-            RelationMemberRole::Inner => inner_segments.push(coordinates.clone()),
+            RelationMemberRole::Outer => outer_segments.push(coordinates.as_slice()),
+            RelationMemberRole::Inner => inner_segments.push(coordinates.as_slice()),
         }
     }
 
@@ -107,11 +107,11 @@ pub(super) fn assemble_relation(
     }
 }
 
-fn stitch_rings(mut segments: Vec<Vec<Coordinate>>) -> Option<Vec<Vec<Coordinate>>> {
+fn stitch_rings(mut segments: Vec<&[Coordinate]>) -> Option<Vec<Vec<Coordinate>>> {
     let mut rings = Vec::new();
 
     while !segments.is_empty() {
-        let mut ring = segments.remove(0);
+        let mut ring = segments.remove(0).to_vec();
         if ring.len() < 2 {
             return None;
         }
@@ -145,7 +145,7 @@ enum StitchAction {
 
 fn find_connecting_segment(
     ring: &[Coordinate],
-    segments: &[Vec<Coordinate>],
+    segments: &[&[Coordinate]],
 ) -> Option<(usize, StitchAction)> {
     let first = *ring.first()?;
     let last = *ring.last()?;
@@ -166,23 +166,73 @@ fn find_connecting_segment(
     })
 }
 
-fn apply_segment(ring: &mut Vec<Coordinate>, mut segment: Vec<Coordinate>, action: StitchAction) {
+/// `segment` is non-empty: `find_connecting_segment` only returns segments with endpoints.
+fn apply_segment(ring: &mut Vec<Coordinate>, segment: &[Coordinate], action: StitchAction) {
+    let last = segment.len() - 1;
     match action {
-        StitchAction::AppendForward => ring.extend(segment.into_iter().skip(1)),
-        StitchAction::AppendReverse => {
-            segment.reverse();
-            ring.extend(segment.into_iter().skip(1));
-        }
+        StitchAction::AppendForward => ring.extend_from_slice(&segment[1..]),
+        StitchAction::AppendReverse => ring.extend(segment[..last].iter().rev().copied()),
         StitchAction::PrependForward => {
-            segment.pop();
-            segment.extend(ring.iter().copied());
-            *ring = segment;
+            ring.splice(0..0, segment[..last].iter().copied());
         }
         StitchAction::PrependReverse => {
-            segment.reverse();
-            segment.pop();
-            segment.extend(ring.iter().copied());
-            *ring = segment;
+            ring.splice(0..0, segment[1..].iter().rev().copied());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn coordinates(values: &[f64]) -> Vec<Coordinate> {
+        values
+            .iter()
+            .map(|value| Coordinate::new(*value, *value))
+            .collect()
+    }
+
+    #[test]
+    fn apply_segment_shares_the_joining_coordinate_in_each_direction() {
+        for (segment, action, expected) in [
+            (
+                [3.0, 4.0, 5.0],
+                StitchAction::AppendForward,
+                vec![2.0, 3.0, 4.0, 5.0],
+            ),
+            (
+                [5.0, 4.0, 3.0],
+                StitchAction::AppendReverse,
+                vec![2.0, 3.0, 4.0, 5.0],
+            ),
+            (
+                [0.0, 1.0, 2.0],
+                StitchAction::PrependForward,
+                vec![0.0, 1.0, 2.0, 3.0],
+            ),
+            (
+                [2.0, 1.0, 0.0],
+                StitchAction::PrependReverse,
+                vec![0.0, 1.0, 2.0, 3.0],
+            ),
+        ] {
+            let mut ring = coordinates(&[2.0, 3.0]);
+            apply_segment(&mut ring, &coordinates(&segment), action);
+            assert_eq!(ring, coordinates(&expected), "{action:?}");
+        }
+    }
+
+    #[test]
+    fn apply_segment_with_single_coordinate_leaves_ring_unchanged() {
+        for action in [
+            StitchAction::AppendForward,
+            StitchAction::AppendReverse,
+            StitchAction::PrependForward,
+            StitchAction::PrependReverse,
+        ] {
+            let mut ring = coordinates(&[2.0, 3.0]);
+            apply_segment(&mut ring, &coordinates(&[3.0]), action);
+            assert_eq!(ring, coordinates(&[2.0, 3.0]), "{action:?}");
         }
     }
 }

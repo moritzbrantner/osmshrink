@@ -13,9 +13,11 @@ use crate::index::{AutoNodeIndex, IndexOptions, NodeIndex, StoredCoordinate};
 use crate::model::{ElementKind, Feature, Tags as NormalizedTags};
 #[cfg(feature = "cli")]
 use crate::output::OutputWriter;
+use crate::spec::ElementType;
+#[cfg(feature = "cli")]
+use crate::spec::FilterSpec;
 #[cfg(feature = "cli")]
 use crate::spec::OutputFormat;
-use crate::spec::{ElementType, FilterSpec};
 
 use super::compiled::CompiledFilter;
 use super::options::{CollectBytesOptions, CollectedFeatures, FilterReport};
@@ -353,23 +355,22 @@ fn process_ways_from_reader<R: Read>(
     sink: &mut dyn FeatureSink,
     report: &mut FilterReport,
 ) -> Result<()> {
+    // Only ways are needed here, and the first pass already decoded every other object.
     let mut reader = OsmPbfReader::new(reader);
-    for object in reader.iter() {
-        let object = object.map_err(|source| OsmshrinkError::Pbf {
+    for way in reader.iter_ways() {
+        let way = way.map_err(|source| OsmshrinkError::Pbf {
             path: input.to_path_buf(),
             source,
         })?;
-        if let OsmObj::Way(way) = object {
-            process_way(
-                &way,
-                compiled,
-                node_index,
-                required_way_ids,
-                relation_way_geometries,
-                sink,
-                report,
-            )?;
-        }
+        process_way(
+            &way,
+            compiled,
+            node_index,
+            required_way_ids,
+            relation_way_geometries,
+            sink,
+            report,
+        )?;
     }
     Ok(())
 }
